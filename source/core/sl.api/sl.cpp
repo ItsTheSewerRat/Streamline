@@ -21,6 +21,11 @@
 */
 
 #include <d3d11.h>
+#include <array>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include "source/core/sl.interposer/d3d12/d3d12.h"
 #include "source/core/sl.interposer/d3d12/d3d12Device.h"
 #include "source/core/sl.interposer/d3d12/d3d12CommandQueue.h"
@@ -41,7 +46,9 @@
 #include "source/core/sl.file/file.h"
 #include "source/core/sl.param/parameters.h"
 #include "source/core/sl.interposer/hook.h"
+#include "source/core/sl.interposer/renodx_streamline_bridge.h"
 #include "source/core/sl.plugin-manager/pluginManager.h"
+#include "source/platforms/sl.chi/compute.h"
 #include "include/sl_helpers.h"
 #include "include/sl_helpers_vk.h"
 
@@ -159,7 +166,248 @@ void ConfigureLogOverrides(log::ILog* log)
     ConfigureLogOverridesFromInterposerConfig(log);
 }
 
+template<typename T>
+T RenoDXGetAddonExport(const char* name)
+{
+    const HMODULE addon = ::GetModuleHandleW(L"renodx-endfield-vk.addon64");
+    return addon ? reinterpret_cast<T>(::GetProcAddress(addon, name)) : nullptr;
+}
+
+bool RenoDXAddonHDR10Enabled()
+{
+    const auto enabled = RenoDXGetAddonExport<
+        renodx::streamline_bridge::IsHDR10EnabledV1>(
+            "RenoDX_Streamline_IsHDR10EnabledV1");
+    return enabled && enabled() != 0u;
+}
+
+PFun_slDLSSGSetOptions* s_renodxOriginalDLSSGSetOptions{};
+
+sl::Result RenoDXDLSSGSetOptions(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSGOptions& options)
+{
+    if (!s_renodxOriginalDLSSGSetOptions)
+    {
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    if (!RenoDXAddonHDR10Enabled())
+    {
+        return s_renodxOriginalDLSSGSetOptions(viewport, options);
+    }
+
+    sl::DLSSGOptions adjustedOptions = options;
+    adjustedOptions.colorBufferFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    adjustedOptions.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
+    return s_renodxOriginalDLSSGSetOptions(viewport, adjustedOptions);
+}
+
+struct RenoDXTaggedTarget
+{
+    sl::chi::Resource resource{};
+    sl::chi::ResourceState state = sl::chi::ResourceState::eUndefined;
+};
+
+struct RenoDXTaggedTargetSet
+{
+    std::array<RenoDXTaggedTarget, MAX_FRAMES_IN_FLIGHT> slots{};
+};
+
+std::mutex s_renodxTaggedTargetMutex;
+std::unordered_map<uint64_t, RenoDXTaggedTargetSet> s_renodxTaggedTargets;
+sl::chi::ICompute* s_renodxTaggedCompute{};
+uint32_t s_renodxLegacyFrame{};
+
+void DestroyRenoDXTaggedTargets()
+{
+    std::lock_guard lock(s_renodxTaggedTargetMutex);
+    if (s_renodxTaggedCompute)
+    {
+        for (auto& entry : s_renodxTaggedTargets)
+        {
+            for (auto& target : entry.second.slots)
+            {
+                if (target.resource)
+                {
+                    s_renodxTaggedCompute->destroyResource(target.resource, 0u);
+                }
+            }
+        }
+    }
+    s_renodxTaggedTargets.clear();
+    s_renodxTaggedCompute = nullptr;
+}
+
+enum class RenoDXTaggedFrameResult
+{
+    eNotApplicable,
+    eConverted,
+    eFailed,
+};
+
+#ifndef SL_PRODUCTION
+#define RENODX_TAG_LOG_ERROR_ONCE(message) SL_LOG_ERROR_ONCE(message)
+#define RENODX_TAG_LOG_INFO_ONCE(message) SL_LOG_INFO_ONCE(message)
+#else
+#define RENODX_TAG_LOG_ERROR_ONCE(message) ((void)0)
+#define RENODX_TAG_LOG_INFO_ONCE(message) ((void)0)
+#endif
+
+RenoDXTaggedFrameResult PrepareRenoDXTaggedFrame(
+    const sl::ResourceTag* tags,
+    uint32_t numTags,
+    sl::CommandBuffer* cmdBuffer,
+    bool frameBased,
+    const sl::FrameToken& frame,
+    std::vector<sl::ResourceTag>* adjustedTags)
+{
+    if (!RenoDXAddonHDR10Enabled())
+    {
+        return RenoDXTaggedFrameResult::eNotApplicable;
+    }
+
+    uint32_t colorIndex = numTags;
+    for (uint32_t i = 0u; i < numTags; ++i)
+    {
+        if (tags[i].type == sl::kBufferTypeHUDLessColor)
+        {
+            colorIndex = i;
+            break;
+        }
+    }
+    if (colorIndex == numTags)
+    {
+        return RenoDXTaggedFrameResult::eNotApplicable;
+    }
+    if (!cmdBuffer || !adjustedTags || !tags[colorIndex].resource
+        || !tags[colorIndex].resource->native
+        || !tags[colorIndex].resource->view)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] Invalid Endfield color tag; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+
+    const auto& source = *tags[colorIndex].resource;
+    if (source.width == 0u || source.height == 0u
+        || source.mipLevels != 1u || source.arrayLayers != 1u)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] Unsupported Endfield color resource; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+
+    sl::chi::ICompute* compute{};
+    if (!sl::param::getPointerParam(sl::param::getInterface(),
+            sl::param::common::kComputeAPI, &compute, true)
+        || !compute)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] Streamline compute API unavailable; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+    sl::RenderAPI renderAPI{};
+    if (compute->getRenderAPI(renderAPI) != sl::chi::ComputeStatus::eOk
+        || renderAPI != sl::RenderAPI::eVulkan)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] Non-Vulkan compute API; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+
+    std::lock_guard lock(s_renodxTaggedTargetMutex);
+    if (s_renodxTaggedCompute && s_renodxTaggedCompute != compute)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] Vulkan compute device changed; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+    s_renodxTaggedCompute = compute;
+
+    const uint32_t frameIndex = frameBased
+        ? static_cast<uint32_t>(frame)
+        : s_renodxLegacyFrame++;
+    const uint64_t targetKey = (static_cast<uint64_t>(source.width) << 32u)
+        | static_cast<uint64_t>(source.height);
+    auto& target = s_renodxTaggedTargets[targetKey].slots[
+        frameIndex % MAX_FRAMES_IN_FLIGHT];
+    if (!target.resource)
+    {
+        const auto flags = sl::chi::ResourceFlags::eShaderResource
+            | sl::chi::ResourceFlags::eColorAttachment;
+        const sl::chi::ResourceDescription description(
+            source.width,
+            source.height,
+            sl::chi::Format::eFormatRGB10A2UN,
+            sl::chi::HeapType::eHeapTypeDefault,
+            sl::chi::ResourceState::eUndefined,
+            flags);
+        if (compute->createTexture2D(
+                description,
+                target.resource,
+                "sl.renodx.endfield.tagged-pq")
+                != sl::chi::ComputeStatus::eOk
+            || !target.resource)
+        {
+            target = {};
+            RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] R10/PQ tag target allocation failed; refusing the native tag");
+            return RenoDXTaggedFrameResult::eFailed;
+        }
+        target.state = sl::chi::ResourceState::eUndefined;
+    }
+
+    sl::chi::ResourceTransition toRenderTarget(
+        target.resource,
+        sl::chi::ResourceState::eColorAttachmentWrite,
+        target.state);
+    if (compute->transitionResources(cmdBuffer, &toRenderTarget, 1u)
+        != sl::chi::ComputeStatus::eOk)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] R10/PQ render-target transition failed; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+    target.state = sl::chi::ResourceState::eColorAttachmentWrite;
+    compute->getNativeResourceState(target.state, target.resource->state);
+
+    const auto convert = RenoDXGetAddonExport<
+        renodx::streamline_bridge::ConvertVulkanTaggedResourceV1>(
+            "RenoDX_Streamline_ConvertVulkanTaggedResourceV1");
+    const bool converted = convert && convert(
+        renodx::streamline_bridge::kAbiVersion,
+        reinterpret_cast<uint64_t>(cmdBuffer),
+        reinterpret_cast<uint64_t>(source.view),
+        reinterpret_cast<uint64_t>(target.resource->view),
+        source.width,
+        source.height) != 0u;
+
+    sl::chi::ResourceTransition toTextureRead(
+        target.resource,
+        sl::chi::ResourceState::eTextureRead,
+        target.state);
+    if (compute->transitionResources(cmdBuffer, &toTextureRead, 1u)
+        != sl::chi::ComputeStatus::eOk)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] R10/PQ texture-read transition failed; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+    target.state = sl::chi::ResourceState::eTextureRead;
+    compute->getNativeResourceState(target.state, target.resource->state);
+    if (!converted)
+    {
+        RENODX_TAG_LOG_ERROR_ONCE("[RenoDX][tag-handoff-v62] Addon did not record the FP16-to-PQ conversion; refusing the native tag");
+        return RenoDXTaggedFrameResult::eFailed;
+    }
+
+    adjustedTags->assign(tags, tags + numTags);
+    (*adjustedTags)[colorIndex].resource = target.resource;
+    RENODX_TAG_LOG_INFO_ONCE("[RenoDX][tag-handoff-v62] Replaced Endfield's color tag with the RenoDX R10/PQ frame");
+    return RenoDXTaggedFrameResult::eConverted;
+}
+
+#undef RENODX_TAG_LOG_ERROR_ONCE
+#undef RENODX_TAG_LOG_INFO_ONCE
+
 } // namespace
+
+extern "C" bool renodxVulkanHDR10Active() noexcept
+{
+    return RenoDXAddonHDR10Enabled();
+}
 
 //! API
 
@@ -217,7 +465,13 @@ sl::Result slInit(const Preferences &pref, uint64_t sdkVersion)
         auto log = log::getInterface();
         log->enableConsole(pref.showConsole);
         log->setLogLevel(pref.logLevel);
+#ifndef SL_PRODUCTION
+        log->setLogPath(pref.pathToLogsAndData && pref.pathToLogsAndData[0] != L'\0'
+            ? pref.pathToLogsAndData
+            : file::getExecutablePath().c_str());
+#else
         log->setLogPath(pref.pathToLogsAndData);
+#endif
         log->setLogCallback((void*)pref.logMessageCallback);
         log->setLogName(L"sl.log");
 
@@ -321,6 +575,7 @@ Result slShutdown()
         SL_LOG_ERROR_ONCE("SL not initialized");
         return Result::eErrorNotInitialized;
     }
+    DestroyRenoDXTaggedTargets();
     manager->unloadPlugins();
 
     plugin_manager::destroyInterface();
@@ -352,8 +607,8 @@ Result slSetFeatureLoaded(sl::Feature feature, bool enabled)
     SL_EXCEPTION_HANDLE_END_RETURN(Result::eErrorExceptionHandler);
 }
 
-Result slSetTagCommon(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags,
-    sl::CommandBuffer* cmdBuffer, bool useResourceTaggingForFrame, const sl::FrameToken& frame = FrameHandleImplementation{})
+Result slSetTagCommonImpl(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags,
+    sl::CommandBuffer* cmdBuffer, bool useResourceTaggingForFrame, const sl::FrameToken& frame)
 {
     //! IMPORTANT:
     //! 
@@ -364,13 +619,32 @@ Result slSetTagCommon(const sl::ViewportHandle& viewport, const sl::ResourceTag*
     static_assert(offsetof(sl::ResourceTag, extent) == 48, "new elements can only be added at the end of each structure");
     static_assert(offsetof(sl::Resource, reserved) == 104, "new elements can only be added at the end of each structure");
 
-    SL_EXCEPTION_HANDLE_START;
     SL_CHECK(slValidateState());
     const sl::plugin_manager::FeatureContext* ctx;
     SL_CHECK(slValidateFeatureContext(kFeatureCommon, ctx));
     if (!tags || numTags == 0) return Result::eErrorInvalidParameter;
-    return (useResourceTaggingForFrame ? ctx->setTagForFrame(frame, viewport, tags, numTags, cmdBuffer)
-        : ctx->setTag(viewport, tags, numTags, cmdBuffer));
+    std::vector<sl::ResourceTag> adjustedTags;
+    const sl::ResourceTag* effectiveTags = tags;
+    const auto renodxTagResult = PrepareRenoDXTaggedFrame(tags, numTags,
+        cmdBuffer, useResourceTaggingForFrame, frame, &adjustedTags);
+    if (renodxTagResult == RenoDXTaggedFrameResult::eFailed)
+    {
+        return Result::eErrorInvalidIntegration;
+    }
+    if (renodxTagResult == RenoDXTaggedFrameResult::eConverted)
+    {
+        effectiveTags = adjustedTags.data();
+    }
+    return (useResourceTaggingForFrame
+        ? ctx->setTagForFrame(frame, viewport, effectiveTags, numTags, cmdBuffer)
+        : ctx->setTag(viewport, effectiveTags, numTags, cmdBuffer));
+}
+
+Result slSetTagCommon(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags,
+    sl::CommandBuffer* cmdBuffer, bool useResourceTaggingForFrame, const sl::FrameToken& frame = FrameHandleImplementation{})
+{
+    SL_EXCEPTION_HANDLE_START;
+    return slSetTagCommonImpl(viewport, tags, numTags, cmdBuffer, useResourceTaggingForFrame, frame);
     SL_EXCEPTION_HANDLE_END_RETURN(Result::eErrorExceptionHandler);
 }
 
@@ -1118,6 +1392,16 @@ Result slGetFeatureFunction(sl::Feature feature, const char* functionName, void*
     }
     if (!functionName) return Result::eErrorInvalidParameter;
     function = ctx->getFunction(functionName);
+    if (function
+        && feature == sl::kFeatureDLSS_G
+        && std::strcmp(functionName, "slDLSSGSetOptions") == 0
+        && plugin_manager::getInterface()->getPreferences().renderAPI
+            == sl::RenderAPI::eVulkan)
+    {
+        s_renodxOriginalDLSSGSetOptions =
+            reinterpret_cast<PFun_slDLSSGSetOptions*>(function);
+        function = reinterpret_cast<void*>(&RenoDXDLSSGSetOptions);
+    }
     return function ? Result::eOk : Result::eErrorMissingOrInvalidAPI;
     SL_EXCEPTION_HANDLE_END_RETURN(Result::eErrorExceptionHandler)
 }

@@ -41,6 +41,10 @@ VkTable s_vk{};
 VkLayerInstanceDispatchTable s_idt{};
 VkLayerDispatchTable s_ddt{};
 
+extern "C" bool renodxVulkanHDR10Active() noexcept;
+
+#include "source/core/sl.interposer/renodx_streamline_client.h"
+
 HMODULE loadVulkanLibrary()
 {
     if (!s_module)
@@ -88,6 +92,8 @@ sl::Result processVulkanInterface(const sl::VulkanInfo* extension)
 
     s_vk.mapVulkanDeviceAPI(s_vk.device);
     s_ddt = s_vk.dispatchDeviceMap[s_vk.device];
+    renodx::streamline_client::Install(s_vk.getDeviceProcAddr);
+    s_vk.getDeviceProcAddr = renodx::streamline_client::GetDeviceProcAddr;
 
     // Allow all plugins to access this information
     sl::param::getInterface()->set(sl::param::global::kVulkanTable, &s_vk);
@@ -943,10 +949,11 @@ extern "C"
 
         s_vk.device = *pDevice;
         s_vk.mapVulkanDeviceAPI(*pDevice);
+        s_ddt = s_vk.dispatchDeviceMap[s_vk.device];
+        renodx::streamline_client::Install(s_vk.getDeviceProcAddr);
+        s_vk.getDeviceProcAddr = renodx::streamline_client::GetDeviceProcAddr;
 
         sl::param::getInterface()->set(sl::param::global::kVulkanTable, &s_vk);
-
-        s_ddt = s_vk.dispatchDeviceMap[s_vk.device];
 
         pluginManager->setVulkanDevice(physicalDevice, *pDevice, s_vk.instance);
         pluginManager->initializePlugins();
@@ -2078,13 +2085,27 @@ extern "C"
 
     VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfoKHR* CreateInfo, const VkAllocationCallbacks* Allocator, VkSwapchainKHR* Swapchain)
     {
+        VkSwapchainCreateInfoKHR renodxCreateInfo{};
+        const VkSwapchainCreateInfoKHR* effectiveCreateInfo = CreateInfo;
+        if (CreateInfo && renodxVulkanHDR10Active())
+        {
+            renodxCreateInfo = *CreateInfo;
+            renodxCreateInfo.imageFormat =
+                VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            renodxCreateInfo.imageColorSpace =
+                VK_COLOR_SPACE_HDR10_ST2084_EXT;
+            effectiveCreateInfo = &renodxCreateInfo;
+        }
+
         bool skip = false;
         VkResult result = VK_SUCCESS;
         {
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_CreateSwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
-                result = ((sl::PFunVkCreateSwapchainKHRBefore*)hook)(Device, CreateInfo, Allocator, Swapchain, skip);
+                result = ((sl::PFunVkCreateSwapchainKHRBefore*)hook)(Device,
+                    feature == sl::kFeatureDLSS_G ? effectiveCreateInfo : CreateInfo,
+                    Allocator, Swapchain, skip);
                 if (result != VK_SUCCESS)
                 {
                     return result;
@@ -2094,14 +2115,23 @@ extern "C"
 
         if (!skip)
         {
-            result = s_ddt.CreateSwapchainKHR(Device, CreateInfo, Allocator, Swapchain);
+            result = s_ddt.CreateSwapchainKHR(
+                Device, effectiveCreateInfo, Allocator, Swapchain);
+        }
+
+        if (result == VK_SUCCESS && Swapchain && *Swapchain)
+        {
+            renodx::streamline_client::OnCreateSwapchain(
+                *Swapchain, *effectiveCreateInfo);
         }
 
         {
             const auto& hooks = sl::plugin_manager::getInterface()->getAfterHooks(sl::FunctionHookID::eVulkan_CreateSwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
-                result = ((sl::PFunVkCreateSwapchainKHRAfter*)hook)(Device, CreateInfo, Allocator, Swapchain);
+                result = ((sl::PFunVkCreateSwapchainKHRAfter*)hook)(Device,
+                    feature == sl::kFeatureDLSS_G ? effectiveCreateInfo : CreateInfo,
+                    Allocator, Swapchain);
                 if (result != VK_SUCCESS)
                 {
                     return result;
@@ -2126,6 +2156,7 @@ extern "C"
         {
             s_ddt.DestroySwapchainKHR(Device, Swapchain, Allocator);
         }
+        renodx::streamline_client::OnDestroySwapchain(Swapchain);
     }
 
     VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice Device, VkSwapchainKHR Swapchain, uint32_t* SwapchainImageCount, VkImage* SwapchainImages)
@@ -2147,6 +2178,12 @@ extern "C"
         if (!skip)
         {
             result = s_ddt.GetSwapchainImagesKHR(Device, Swapchain, SwapchainImageCount, SwapchainImages);
+        }
+        if (SwapchainImages && SwapchainImageCount
+            && (result == VK_SUCCESS || result == VK_INCOMPLETE))
+        {
+            renodx::streamline_client::OnGetSwapchainImages(
+                Swapchain, *SwapchainImageCount, SwapchainImages);
         }
         return result;
     }
@@ -2172,6 +2209,10 @@ extern "C"
         {
             result = s_ddt.AcquireNextImageKHR(Device, Swapchain, Timeout, Semaphore, Fence, ImageIndex);
         }
+        if (ImageIndex && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
+        {
+            renodx::streamline_client::OnAcquire(Swapchain, *ImageIndex);
+        }
         return result;
     }
 
@@ -2184,7 +2225,15 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(hooksId);
             for (auto [hook, feature] : hooks)
             {
+                if (feature == sl::kFeatureDLSS_G)
+                {
+                    renodx::streamline_client::BeginOuterPresentHook();
+                }
                 result = ((sl::PFunVkQueuePresentKHRBefore*)hook)(Queue, PresentInfo, skip);
+                if (feature == sl::kFeatureDLSS_G)
+                {
+                    renodx::streamline_client::EndOuterPresentHook();
+                }
                 // report error on first fail
                 if (result != VK_SUCCESS)
                 {

@@ -251,7 +251,7 @@ project "sl.interposer"
 	characterset ("MBCS")
 	staticruntime "off"
 	
-	prebuildcommands { 'pushd ' .. path.translate(out_dir()), path.translate(TOOLS) .. "gitVersion.bat", 'popd' }
+	prebuildcommands { 'pushd "' .. path.translate(out_dir()) .. '"', '"' .. path.translate(TOOLS) .. 'gitVersion.bat"', 'popd' }
 
 	
 	filter { filter_platforms }
