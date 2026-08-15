@@ -153,7 +153,8 @@ inline bool SetDisplayReadyPQPresent(bool active)
             if (setter)
             {
                 set_display_ready_pq_present.store(
-                    setter, std::memory_order_release);
+                    setter,
+                    std::memory_order_release);
             }
         }
     }
@@ -251,11 +252,6 @@ inline void OnGetSwapchainImages(
 
 inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
 {
-    if (!IsProcessForeground())
-    {
-        return;
-    }
-
     VkImage image{};
     ImageInfo info{};
     SwapchainInfo pending_swapchain{};
@@ -341,11 +337,6 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
 
 inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
 {
-    if (!IsProcessForeground())
-    {
-        return false;
-    }
-
     ImageInfo info{};
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -366,7 +357,7 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
     {
         static std::once_flag logged;
         std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] Preserved the UI-relative frame in FP16 and encoded it to PQ at the native DLSS-G read barrier");
+            SL_LOG_INFO("[RenoDX][client-fp16] Preserved the native frame in FP16 and encoded it to PQ at the DLSS-G read barrier");
         });
         return true;
     }
@@ -380,6 +371,26 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
     SL_LOG_ERROR("[RenoDX][client-fp16] Failed to convert client image 0x%llx",
         static_cast<unsigned long long>(Handle(image)));
     return false;
+}
+
+inline void ConvertDisplay(VkCommandBuffer command_buffer, VkImage image)
+{
+    const auto manager = GetManager();
+    if (!manager || !manager(
+            renodx::streamline_bridge::kAbiVersion,
+            renodx::streamline_bridge::kClientImageOperationConvertDisplay,
+            Handle(command_buffer),
+            Handle(image),
+            0u,
+            0u,
+            0u))
+    {
+        return;
+    }
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        SL_LOG_INFO("[RenoDX][display-pq] Copied generated PQ into the physical swapchain image on DLSS-G's command buffer");
+    });
 }
 
 inline void VKAPI_CALL CmdPipelineBarrier(
@@ -422,6 +433,17 @@ inline void VKAPI_CALL CmdPipelineBarrier(
         buffer_memory_barriers,
         image_memory_barrier_count,
         rewritten.empty() ? image_memory_barriers : rewritten.data());
+
+    for (uint32_t i = 0u;
+        image_memory_barriers && i < image_memory_barrier_count;
+        ++i)
+    {
+        if (image_memory_barriers[i].newLayout
+            == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+        {
+            ConvertDisplay(command_buffer, image_memory_barriers[i].image);
+        }
+    }
 }
 
 inline void VKAPI_CALL CmdPipelineBarrier2(
@@ -461,45 +483,45 @@ inline void VKAPI_CALL CmdPipelineBarrier2(
     s_ddt.CmdPipelineBarrier2(
         command_buffer,
         rewritten.empty() ? dependency_info : &rewritten_dependency);
+
+    if (dependency_info)
+    {
+        for (uint32_t i = 0u;
+            dependency_info->pImageMemoryBarriers
+                && i < dependency_info->imageMemoryBarrierCount;
+            ++i)
+        {
+            const auto& barrier = dependency_info->pImageMemoryBarriers[i];
+            if (barrier.newLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+            {
+                ConvertDisplay(command_buffer, barrier.image);
+            }
+        }
+    }
 }
+
 
 inline VkResult VKAPI_CALL QueuePresent(
     VkQueue queue,
     const VkPresentInfoKHR* present_info)
 {
     const bool asynchronous = outer_present_hook_depth == 0u;
-    if (asynchronous && !IsProcessForeground())
-    {
-        return s_ddt.QueuePresentKHR(queue, present_info);
-    }
-    if (asynchronous)
+    const bool marked = asynchronous && SetDisplayReadyPQPresent(true);
+    if (asynchronous && !marked)
     {
         static std::once_flag logged;
         std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] Using PQ copy for asynchronous DLSS-G presents");
+            SL_LOG_ERROR("[RenoDX][client-fp16] Failed to mark DLSS-G display-ready present");
         });
     }
-    else
-    {
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] Using normal RenoDX encoding for synchronous pass-through presents");
-        });
-    }
-    const bool signaled = asynchronous && SetDisplayReadyPQPresent(true);
-    if (asynchronous && !signaled)
-    {
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            SL_LOG_ERROR("[RenoDX][client-fp16] Failed to select the display-ready PQ present path");
-        });
-    }
+
     const VkResult result = s_ddt.QueuePresentKHR(queue, present_info);
-    if (signaled && !SetDisplayReadyPQPresent(false))
+
+    if (marked && !SetDisplayReadyPQPresent(false))
     {
         static std::once_flag logged;
         std::call_once(logged, [] {
-            SL_LOG_ERROR("[RenoDX][client-fp16] Failed to release the display-ready PQ present path");
+            SL_LOG_ERROR("[RenoDX][client-fp16] Failed to clear DLSS-G display-ready present");
         });
     }
     return result;
@@ -511,10 +533,6 @@ inline PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(
 {
     if (name && strcmp(name, "vkQueuePresentKHR") == 0)
     {
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] DLSS-G requested the display-ready PQ present function");
-        });
         return reinterpret_cast<PFN_vkVoidFunction>(QueuePresent);
     }
     if (name && strcmp(name, "vkCmdPipelineBarrier") == 0)
