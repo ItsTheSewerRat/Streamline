@@ -4,13 +4,14 @@
 
 namespace renodx::streamline_bridge {
 
-constexpr uint32_t kAbiVersion = 3u;
+constexpr uint32_t kAbiVersion = 4u;
 constexpr uint32_t kClientImageOperationRegister = 1u;
 constexpr uint32_t kClientImageOperationActivate = 2u;
 constexpr uint32_t kClientImageOperationConvert = 3u;
 constexpr uint32_t kClientImageOperationConvertDisplay = 4u;
 
 using IsHDR10EnabledV1 = uint32_t(__cdecl*)() noexcept;
+using GetVulkanOutputFormatV1 = uint32_t(__cdecl*)() noexcept;
 using ConvertVulkanTaggedResourceV1 = uint32_t(__cdecl*)(
     uint32_t abi_version,
     uint64_t command_buffer,

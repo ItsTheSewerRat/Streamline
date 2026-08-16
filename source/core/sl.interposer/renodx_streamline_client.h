@@ -129,7 +129,7 @@ inline bool RegisterClientImages(
         }
         static std::once_flag logged;
         std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] Registered Streamline client images with FP16 clones");
+            SL_LOG_INFO("[RenoDX][client-fp16] Registered SDR/HDR10 Streamline client images with FP16 clones");
         });
         std::lock_guard<std::mutex> lock(mutex);
         images[Handle(image)] = image_info;
@@ -181,7 +181,9 @@ inline void OnCreateSwapchain(
     const VkSwapchainCreateInfoKHR& create_info)
 {
     if (!swapchain
-        || create_info.imageFormat != VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+        || (create_info.imageFormat != VK_FORMAT_R8G8B8A8_UNORM
+            && create_info.imageFormat
+                != VK_FORMAT_A2B10G10R10_UNORM_PACK32))
     {
         return;
     }
@@ -357,7 +359,7 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
     {
         static std::once_flag logged;
         std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] Preserved the native frame in FP16 and encoded it to PQ at the DLSS-G read barrier");
+            SL_LOG_INFO("[RenoDX][client-fp16] Preserved the native frame in FP16 and encoded it for DLSS-G at the read barrier");
         });
         return true;
     }
@@ -389,7 +391,7 @@ inline void ConvertDisplay(VkCommandBuffer command_buffer, VkImage image)
     }
     static std::once_flag logged;
     std::call_once(logged, [] {
-        SL_LOG_INFO("[RenoDX][display-pq] Copied generated PQ into the physical swapchain image on DLSS-G's command buffer");
+        SL_LOG_INFO("[RenoDX][display-output] Copied the generated frame into the physical swapchain image on DLSS-G's command buffer");
     });
 }
 
