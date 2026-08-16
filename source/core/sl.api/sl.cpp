@@ -190,56 +190,6 @@ bool RenoDXAddonHDR10Enabled()
 PFun_slDLSSGGetState* s_renodxOriginalDLSSGGetState{};
 PFun_slDLSSGSetOptions* s_renodxOriginalDLSSGSetOptions{};
 
-enum class RenoDXDLSSGFocusPhase : uint32_t
-{
-    eNormal,
-    eBackground,
-    eResumeBoundary,
-    eRestorePending,
-};
-
-std::mutex s_renodxDLSSGFocusMutex;
-RenoDXDLSSGFocusPhase s_renodxDLSSGFocusPhase =
-    RenoDXDLSSGFocusPhase::eNormal;
-bool s_renodxDLSSGOffApplied{};
-std::unordered_map<uint32_t, sl::DLSSGOptions>
-    s_renodxDLSSGSavedOptions;
-
-bool RenoDXProcessIsForeground()
-{
-    const HWND foreground = ::GetForegroundWindow();
-    DWORD process_id{};
-    return foreground
-        && ::GetWindowThreadProcessId(foreground, &process_id) != 0u
-        && process_id == ::GetCurrentProcessId();
-}
-
-void UpdateRenoDXDLSSGFocusLocked(bool foreground)
-{
-    if (!foreground)
-    {
-        if (s_renodxDLSSGFocusPhase
-            != RenoDXDLSSGFocusPhase::eBackground)
-        {
-            s_renodxDLSSGFocusPhase =
-                RenoDXDLSSGFocusPhase::eBackground;
-            s_renodxDLSSGOffApplied = false;
-            SL_LOG_INFO(
-                "[RenoDX][focus-cycle] Holding DLSS-G Off while Endfield is unfocused");
-        }
-        return;
-    }
-
-    if (s_renodxDLSSGFocusPhase
-        == RenoDXDLSSGFocusPhase::eBackground)
-    {
-        s_renodxDLSSGFocusPhase =
-            RenoDXDLSSGFocusPhase::eResumeBoundary;
-        SL_LOG_INFO(
-            "[RenoDX][focus-cycle] Endfield regained focus; keeping DLSS-G Off through one native present");
-    }
-}
-
 sl::DLSSGOptions AdjustRenoDXDLSSGOptions(
     const sl::DLSSGOptions& options,
     uint32_t output_format)
@@ -253,30 +203,6 @@ sl::DLSSGOptions AdjustRenoDXDLSSGOptions(
             sl::Boolean::eFalse;
     }
     return adjusted_options;
-}
-
-sl::DLSSGOptions DisableRenoDXDLSSGOptions(
-    const sl::DLSSGOptions& options,
-    bool set_options)
-{
-    sl::DLSSGOptions disabled_options = options;
-    disabled_options.mode = sl::DLSSGMode::eOff;
-    disabled_options.numFramesToGenerate = set_options
-        ? std::max(options.numFramesToGenerate, 1u)
-        : 0u;
-    disabled_options.flags &=
-        ~sl::DLSSGFlags::eRetainResourcesWhenOff;
-    return disabled_options;
-}
-
-void SaveRenoDXDLSSGOptions(
-    const sl::ViewportHandle& viewport,
-    const sl::DLSSGOptions& options)
-{
-    sl::DLSSGOptions saved_options = options;
-    saved_options.next = nullptr;
-    s_renodxDLSSGSavedOptions.insert_or_assign(
-        static_cast<uint32_t>(viewport), saved_options);
 }
 
 sl::Result RenoDXDLSSGSetOptions(
@@ -296,41 +222,7 @@ sl::Result RenoDXDLSSGSetOptions(
 
     const sl::DLSSGOptions adjusted_options =
         AdjustRenoDXDLSSGOptions(options, output_format);
-    if (output_format == VK_FORMAT_R8G8B8A8_UNORM)
-    {
-        return s_renodxOriginalDLSSGSetOptions(viewport, adjusted_options);
-    }
-
-    std::lock_guard lock(s_renodxDLSSGFocusMutex);
-    UpdateRenoDXDLSSGFocusLocked(RenoDXProcessIsForeground());
-
-    SaveRenoDXDLSSGOptions(viewport, adjusted_options);
-
-    const bool force_off = s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eBackground
-        || s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eResumeBoundary;
-    const sl::DLSSGOptions effective_options = force_off
-        ? DisableRenoDXDLSSGOptions(adjusted_options, true)
-        : adjusted_options;
-    const sl::Result result =
-        s_renodxOriginalDLSSGSetOptions(viewport, effective_options);
-    if (result == sl::Result::eOk)
-    {
-        if (force_off)
-        {
-            s_renodxDLSSGOffApplied = true;
-        }
-        else if (s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eRestorePending)
-        {
-            s_renodxDLSSGFocusPhase =
-                RenoDXDLSSGFocusPhase::eNormal;
-            SL_LOG_INFO(
-                "[RenoDX][focus-cycle] Restored the game's DLSS-G options after the native resume boundary");
-        }
-    }
-    return result;
+    return s_renodxOriginalDLSSGSetOptions(viewport, adjusted_options);
 }
 
 sl::Result RenoDXDLSSGGetState(
@@ -348,71 +240,15 @@ sl::Result RenoDXDLSSGGetState(
     {
         return s_renodxOriginalDLSSGGetState(viewport, state, options);
     }
-    if (output_format == VK_FORMAT_R8G8B8A8_UNORM)
+    if (options == nullptr)
     {
-        if (options == nullptr)
-        {
-            return s_renodxOriginalDLSSGGetState(
-                viewport, state, nullptr);
-        }
-        const sl::DLSSGOptions adjusted_options =
-            AdjustRenoDXDLSSGOptions(*options, output_format);
         return s_renodxOriginalDLSSGGetState(
-            viewport, state, &adjusted_options);
+            viewport, state, nullptr);
     }
-
-    std::lock_guard lock(s_renodxDLSSGFocusMutex);
-    UpdateRenoDXDLSSGFocusLocked(RenoDXProcessIsForeground());
-
-    sl::DLSSGOptions adjusted_options{};
-    const sl::DLSSGOptions* effective_options = nullptr;
-    if (options != nullptr)
-    {
-        adjusted_options = AdjustRenoDXDLSSGOptions(
-            *options, output_format);
-        SaveRenoDXDLSSGOptions(viewport, adjusted_options);
-        effective_options = &adjusted_options;
-    }
-    else
-    {
-        const auto saved = s_renodxDLSSGSavedOptions.find(
-            static_cast<uint32_t>(viewport));
-        if (saved != s_renodxDLSSGSavedOptions.end())
-        {
-            adjusted_options = saved->second;
-            effective_options = &adjusted_options;
-        }
-    }
-
-    const bool force_off = s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eBackground
-        || s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eResumeBoundary;
-    if (force_off && effective_options != nullptr)
-    {
-        adjusted_options =
-            DisableRenoDXDLSSGOptions(adjusted_options, false);
-    }
-
-    const sl::Result result = s_renodxOriginalDLSSGGetState(
-        viewport, state, effective_options);
-    if (result == sl::Result::eOk)
-    {
-        if (force_off && effective_options != nullptr)
-        {
-            s_renodxDLSSGOffApplied = true;
-        }
-        else if (s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eRestorePending
-            && effective_options != nullptr)
-        {
-            s_renodxDLSSGFocusPhase =
-                RenoDXDLSSGFocusPhase::eNormal;
-            SL_LOG_INFO(
-                "[RenoDX][focus-cycle] Restored the game's DLSS-G options after the native resume boundary");
-        }
-    }
-    return result;
+    const sl::DLSSGOptions adjusted_options =
+        AdjustRenoDXDLSSGOptions(*options, output_format);
+    return s_renodxOriginalDLSSGGetState(
+        viewport, state, &adjusted_options);
 }
 
 struct RenoDXTaggedTarget
@@ -643,27 +479,6 @@ RenoDXTaggedFrameResult PrepareRenoDXTaggedFrame(
 #undef RENODX_TAG_LOG_INFO_ONCE
 
 } // namespace
-
-extern "C" void renodxUpdateDLSSGFocusRecovery(
-    uint32_t foreground) noexcept
-{
-    std::lock_guard lock(s_renodxDLSSGFocusMutex);
-    UpdateRenoDXDLSSGFocusLocked(foreground != 0u);
-}
-
-extern "C" void renodxCompleteDLSSGFocusRecovery() noexcept
-{
-    std::lock_guard lock(s_renodxDLSSGFocusMutex);
-    if (s_renodxDLSSGFocusPhase
-            == RenoDXDLSSGFocusPhase::eResumeBoundary
-        && s_renodxDLSSGOffApplied)
-    {
-        s_renodxDLSSGFocusPhase =
-            RenoDXDLSSGFocusPhase::eRestorePending;
-        SL_LOG_INFO(
-            "[RenoDX][focus-cycle] Native resume present completed; releasing the game's DLSS-G options");
-    }
-}
 
 extern "C" bool renodxVulkanHDR10Active() noexcept
 {

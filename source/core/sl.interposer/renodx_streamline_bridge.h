@@ -34,7 +34,3 @@ using SetVulkanDisplayReadyPQPresentV1 = uint32_t(__cdecl*)(
     uint32_t active) noexcept;
 
 }  // namespace renodx::streamline_bridge
-
-extern "C" void renodxUpdateDLSSGFocusRecovery(
-    uint32_t foreground) noexcept;
-extern "C" void renodxCompleteDLSSGFocusRecovery() noexcept;

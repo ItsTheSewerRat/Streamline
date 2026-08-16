@@ -2218,9 +2218,6 @@ extern "C"
 
     VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentInfo)
     {
-        renodxUpdateDLSSGFocusRecovery(
-            renodx::streamline_client::IsProcessForeground() ? 1u : 0u);
-
         bool skip = false;
         VkResult result = VK_SUCCESS;
         auto hooksId = sl::FunctionHookID::eVulkan_Present;
@@ -2262,8 +2259,6 @@ extern "C"
                 }
             }
         }
-
-        renodxCompleteDLSSGFocusRecovery();
         return result;
     }
 

@@ -55,15 +55,6 @@ uint64_t Handle(T value)
     }
 }
 
-inline bool IsProcessForeground()
-{
-    const HWND foreground = ::GetForegroundWindow();
-    DWORD process_id{};
-    return foreground
-        && ::GetWindowThreadProcessId(foreground, &process_id) != 0u
-        && process_id == ::GetCurrentProcessId();
-}
-
 inline renodx::streamline_bridge::ManageVulkanClientImageV1 GetManager()
 {
     auto manager = manage_client_image.load(std::memory_order_acquire);
