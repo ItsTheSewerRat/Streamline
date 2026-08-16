@@ -195,6 +195,7 @@ sl::DLSSGOptions AdjustRenoDXDLSSGOptions(
     sl::DLSSGOptions adjusted_options = options;
     adjusted_options.colorBufferFormat = output_format;
     adjusted_options.hudLessBufferFormat = output_format;
+    adjusted_options.flags |= sl::DLSSGFlags::eRetainResourcesWhenOff;
     if (output_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
     {
         adjusted_options.enableUserInterfaceRecomposition =
