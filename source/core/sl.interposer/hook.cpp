@@ -42,8 +42,6 @@ struct Hook : public IHook
 {    
     Hook()
     {
-#ifndef SL_PRODUCTION
-
 #define SL_EXTRACT_CONFIG_FLAG(a)                                                   \
 if (config.contains(#a))                                                            \
 {                                                                                   \
@@ -64,22 +62,26 @@ if (config.contains(#a))                                                        
                 if (!jsonText.empty())
                 {
                     json config = json::parse(jsonText.begin(), jsonText.end(), nullptr, /* allow exceptions: */ true, /* ignore comments: */ true);
-                    
+
+#ifndef SL_PRODUCTION
                     SL_EXTRACT_CONFIG_FLAG(enableInterposer);
                     SL_EXTRACT_CONFIG_FLAG(useDXGIProxy);
                     SL_EXTRACT_CONFIG_FLAG(loadAllFeatures);
-                    SL_EXTRACT_CONFIG_FLAG(showConsole);
                     SL_EXTRACT_CONFIG_FLAG(vkValidation);
-                    SL_EXTRACT_CONFIG_FLAG(logPath);
                     SL_EXTRACT_CONFIG_FLAG(pathToPlugins);
-                    SL_EXTRACT_CONFIG_FLAG(logLevel);
-                    SL_EXTRACT_CONFIG_FLAG(logMessageDelayMs);
                     SL_EXTRACT_CONFIG_FLAG(waitForDebugger);
                     SL_EXTRACT_CONFIG_FLAG(forceProxies);
                     SL_EXTRACT_CONFIG_FLAG(forceNonNVDA);
                     SL_EXTRACT_CONFIG_FLAG(trackEngineAllocations);
                     SL_EXTRACT_CONFIG_FLAG(enableD3D12DebugLayer);
+#endif
 
+                    SL_EXTRACT_CONFIG_FLAG(showConsole);
+                    SL_EXTRACT_CONFIG_FLAG(logPath);
+                    SL_EXTRACT_CONFIG_FLAG(logLevel);
+                    SL_EXTRACT_CONFIG_FLAG(logMessageDelayMs);
+
+#ifndef SL_PRODUCTION
                     if (m_config.trackEngineAllocations)
                     {
                         m_config.forceProxies = true;
@@ -95,6 +97,7 @@ if (config.contains(#a))                                                        
                             m_config.loadSpecificFeatures.push_back((Feature)id);
                         }
                     }
+#endif
                 }
                 break;
             }
@@ -104,7 +107,7 @@ if (config.contains(#a))                                                        
                 m_configPath.clear();
             }
         }
-#endif
+#undef SL_EXTRACT_CONFIG_FLAG
     };
 
     void setUseDXGIProxy(bool value) override final

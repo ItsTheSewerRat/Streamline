@@ -62,7 +62,6 @@ LogLevel ToLogLevel(int logLevel) {
 
 void ConfigureLogOverridesFromInterposerConfig(log::ILog* log)
 {
-#ifndef SL_PRODUCTION
     if (sl::interposer::getInterface()->isEnabled() &&
        !sl::interposer::getInterface()->getConfigPath().empty())
     {
@@ -77,7 +76,6 @@ void ConfigureLogOverridesFromInterposerConfig(log::ILog* log)
         SL_LOG_HINT("Overriding interposer settings with values from %S\\sl.interposer.json",
                     sl::interposer::getInterface()->getConfigPath().c_str());
     }
-#endif
 }
 
 void ConfigureLogOverridesFromRegistry(log::ILog* log)
@@ -541,13 +539,9 @@ sl::Result slInit(const Preferences &pref, uint64_t sdkVersion)
         auto log = log::getInterface();
         log->enableConsole(pref.showConsole);
         log->setLogLevel(pref.logLevel);
-#ifndef SL_PRODUCTION
         log->setLogPath(pref.pathToLogsAndData && pref.pathToLogsAndData[0] != L'\0'
             ? pref.pathToLogsAndData
             : file::getExecutablePath().c_str());
-#else
-        log->setLogPath(pref.pathToLogsAndData);
-#endif
         log->setLogCallback((void*)pref.logMessageCallback);
         log->setLogName(L"sl.log");
 
