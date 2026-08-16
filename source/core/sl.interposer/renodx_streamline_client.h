@@ -27,6 +27,7 @@ struct SwapchainInfo {
     uint32_t format{};
     std::vector<VkImage> images;
     std::chrono::steady_clock::time_point registration_ready_at{};
+    bool registration_in_progress{};
 };
 
 inline std::mutex mutex;
@@ -213,7 +214,7 @@ inline void OnGetSwapchainImages(
     }
 
     SwapchainInfo info{};
-    bool defer_registration{};
+    std::vector<VkImage> pending_images;
     {
         std::lock_guard<std::mutex> lock(mutex);
         const auto found = swapchains.find(Handle(swapchain));
@@ -234,12 +235,29 @@ inline void OnGetSwapchainImages(
             }
         }
         info = found->second;
-        defer_registration = !initial_registration_complete;
+        if (initial_registration_complete
+            && !found->second.registration_in_progress)
+        {
+            for (const VkImage image : found->second.images)
+            {
+                if (images.find(Handle(image)) == images.end())
+                {
+                    pending_images.push_back(image);
+                }
+            }
+            found->second.registration_in_progress = !pending_images.empty();
+        }
     }
 
-    if (!defer_registration)
+    if (!pending_images.empty())
     {
-        RegisterClientImages(info, info.images);
+        RegisterClientImages(info, pending_images);
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = swapchains.find(Handle(swapchain));
+        if (found != swapchains.end())
+        {
+            found->second.registration_in_progress = false;
+        }
     }
 }
 
@@ -249,6 +267,7 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
     ImageInfo info{};
     SwapchainInfo pending_swapchain{};
     std::vector<VkImage> pending_images;
+    bool completes_initial_registration{};
     {
         std::lock_guard<std::mutex> lock(mutex);
         const auto found = swapchains.find(Handle(swapchain));
@@ -260,10 +279,11 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         const auto image_found = images.find(Handle(image));
         if (image_found == images.end())
         {
-            if (initial_registration_complete
+            if (found->second.registration_in_progress
                 || initial_registration_in_progress
-                || std::chrono::steady_clock::now()
-                    < found->second.registration_ready_at)
+                || (!initial_registration_complete
+                    && std::chrono::steady_clock::now()
+                        < found->second.registration_ready_at))
             {
                 return;
             }
@@ -275,7 +295,12 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
                 }
             }
             pending_swapchain = found->second;
-            initial_registration_in_progress = true;
+            found->second.registration_in_progress = true;
+            if (!initial_registration_complete)
+            {
+                initial_registration_in_progress = true;
+                completes_initial_registration = true;
+            }
         }
         else
         {
@@ -288,8 +313,16 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         const bool registered =
             RegisterClientImages(pending_swapchain, pending_images);
         std::lock_guard<std::mutex> lock(mutex);
-        initial_registration_in_progress = false;
-        initial_registration_complete = registered;
+        const auto swapchain_found = swapchains.find(Handle(swapchain));
+        if (swapchain_found != swapchains.end())
+        {
+            swapchain_found->second.registration_in_progress = false;
+        }
+        if (completes_initial_registration)
+        {
+            initial_registration_in_progress = false;
+            initial_registration_complete = registered;
+        }
         if (!registered)
         {
             return;
@@ -300,10 +333,13 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
             return;
         }
         info = image_found->second;
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            SL_LOG_INFO("[RenoDX][client-fp16] Applied the 500 ms initialization delay to the first Streamline client-image set only");
-        });
+        if (completes_initial_registration)
+        {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                SL_LOG_INFO("[RenoDX][client-fp16] Delayed only the initial Streamline client-image registration by 500 ms");
+            });
+        }
     }
 
     if (!Manage(
