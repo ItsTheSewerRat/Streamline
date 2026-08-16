@@ -188,6 +188,13 @@ bool RenoDXAddonHDR10Enabled()
 PFun_slDLSSGGetState* s_renodxOriginalDLSSGGetState{};
 PFun_slDLSSGSetOptions* s_renodxOriginalDLSSGSetOptions{};
 
+void TrackRenoDXDLSSGOptions(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSGOptions& options);
+void TrackRenoDXDLSSGState(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSGState& state);
+
 sl::DLSSGOptions AdjustRenoDXDLSSGOptions(
     const sl::DLSSGOptions& options,
     uint32_t output_format)
@@ -213,15 +220,20 @@ sl::Result RenoDXDLSSGSetOptions(
         return sl::Result::eErrorMissingOrInvalidAPI;
     }
     const uint32_t output_format = RenoDXAddonVulkanOutputFormat();
-    if (output_format != VK_FORMAT_R8G8B8A8_UNORM
-        && output_format != VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+    sl::DLSSGOptions adjusted_options = options;
+    if (output_format == VK_FORMAT_R8G8B8A8_UNORM
+        || output_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
     {
-        return s_renodxOriginalDLSSGSetOptions(viewport, options);
+        adjusted_options = AdjustRenoDXDLSSGOptions(
+            options, output_format);
     }
-
-    const sl::DLSSGOptions adjusted_options =
-        AdjustRenoDXDLSSGOptions(options, output_format);
-    return s_renodxOriginalDLSSGSetOptions(viewport, adjusted_options);
+    const sl::Result result = s_renodxOriginalDLSSGSetOptions(
+        viewport, adjusted_options);
+    if (result == sl::Result::eOk)
+    {
+        TrackRenoDXDLSSGOptions(viewport, adjusted_options);
+    }
+    return result;
 }
 
 sl::Result RenoDXDLSSGGetState(
@@ -234,38 +246,140 @@ sl::Result RenoDXDLSSGGetState(
         return sl::Result::eErrorMissingOrInvalidAPI;
     }
     const uint32_t output_format = RenoDXAddonVulkanOutputFormat();
-    if (output_format != VK_FORMAT_R8G8B8A8_UNORM
-        && output_format != VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+    sl::DLSSGOptions adjusted_options{};
+    const sl::DLSSGOptions* effective_options = options;
+    if (options != nullptr
+        && (output_format == VK_FORMAT_R8G8B8A8_UNORM
+            || output_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32))
     {
-        return s_renodxOriginalDLSSGGetState(viewport, state, options);
+        adjusted_options = AdjustRenoDXDLSSGOptions(
+            *options, output_format);
+        effective_options = &adjusted_options;
     }
-    if (options == nullptr)
+    const sl::Result result = s_renodxOriginalDLSSGGetState(
+        viewport, state, effective_options);
+    if (result == sl::Result::eOk)
     {
-        return s_renodxOriginalDLSSGGetState(
-            viewport, state, nullptr);
+        TrackRenoDXDLSSGState(viewport, state);
     }
-    const sl::DLSSGOptions adjusted_options =
-        AdjustRenoDXDLSSGOptions(*options, output_format);
-    return s_renodxOriginalDLSSGGetState(
-        viewport, state, &adjusted_options);
+    return result;
 }
 
 struct RenoDXTaggedTarget
 {
     sl::chi::Resource resource{};
     sl::chi::ResourceState state = sl::chi::ResourceState::eUndefined;
+    sl::chi::Fence completion_fence{};
+    uint64_t completion_value{};
+    bool awaiting_completion_fence{};
 };
 
 struct RenoDXTaggedTargetSet
 {
     std::array<RenoDXTaggedTarget, MAX_FRAMES_IN_FLIGHT> slots{};
-    sl::chi::Format format = sl::chi::Format::eFormatINVALID;
+};
+
+struct RenoDXTaggedTargetVariants
+{
+    std::array<RenoDXTaggedTargetSet, 2u> formats{};
+};
+
+struct RenoDXTaggedViewport
+{
+    RenoDXTaggedTarget* pending_target{};
+    std::vector<RenoDXTaggedTarget*> presented_targets;
+    bool dlssg_enabled = true;
 };
 
 std::mutex s_renodxTaggedTargetMutex;
-std::unordered_map<uint64_t, RenoDXTaggedTargetSet> s_renodxTaggedTargets;
+std::unordered_map<uint64_t, RenoDXTaggedTargetVariants> s_renodxTaggedTargets;
+std::unordered_map<uint32_t, RenoDXTaggedViewport> s_renodxTaggedViewports;
 sl::chi::ICompute* s_renodxTaggedCompute{};
 uint32_t s_renodxLegacyFrame{};
+
+void TrackRenoDXDLSSGOptions(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSGOptions& options)
+{
+    std::lock_guard lock(s_renodxTaggedTargetMutex);
+    s_renodxTaggedViewports[static_cast<uint32_t>(viewport)].dlssg_enabled =
+        options.mode != sl::DLSSGMode::eOff
+        && options.numFramesToGenerate != 0u;
+}
+
+void TrackRenoDXDLSSGState(
+    const sl::ViewportHandle& viewport,
+    const sl::DLSSGState& state)
+{
+    std::lock_guard lock(s_renodxTaggedTargetMutex);
+    const auto found = s_renodxTaggedViewports.find(
+        static_cast<uint32_t>(viewport));
+    if (found == s_renodxTaggedViewports.end()
+        || found->second.presented_targets.empty())
+    {
+        return;
+    }
+
+    const auto completion_fence = static_cast<sl::chi::Fence>(
+        state.inputsProcessingCompletionFence);
+    if (!completion_fence
+        || state.lastPresentInputsProcessingCompletionFenceValue == 0u)
+    {
+        if (found->second.dlssg_enabled)
+        {
+            return;
+        }
+        for (RenoDXTaggedTarget* target : found->second.presented_targets)
+        {
+            target->completion_fence = nullptr;
+            target->completion_value = 0u;
+            target->awaiting_completion_fence = false;
+        }
+        found->second.presented_targets.clear();
+        return;
+    }
+
+    for (RenoDXTaggedTarget* target : found->second.presented_targets)
+    {
+        target->completion_fence = completion_fence;
+        target->completion_value = std::max(
+            target->completion_value,
+            state.lastPresentInputsProcessingCompletionFenceValue);
+        target->awaiting_completion_fence = false;
+    }
+    found->second.presented_targets.clear();
+}
+
+bool SynchronizeRenoDXTaggedTarget(
+    sl::chi::ICompute* compute,
+    RenoDXTaggedTarget* target)
+{
+    if (target->awaiting_completion_fence)
+    {
+        SL_LOG_ERROR("[RenoDX][tag-fence-v1] DLSS-G completion state was not available before tagged target reuse");
+        return false;
+    }
+    if (!target->completion_fence || target->completion_value == 0u)
+    {
+        return true;
+    }
+    if (compute->getCompletedValue(target->completion_fence)
+        < target->completion_value)
+    {
+        SL_LOG_INFO_ONCE("[RenoDX][tag-fence-v1] Waiting for DLSS-G input processing before tagged target reuse");
+        if (compute->waitCPUFence(
+                target->completion_fence,
+                target->completion_value)
+            != sl::chi::WaitStatus::eNoTimeout)
+        {
+            SL_LOG_ERROR("[RenoDX][tag-fence-v1] DLSS-G input completion wait failed; refusing tagged target reuse");
+            return false;
+        }
+    }
+    target->completion_fence = nullptr;
+    target->completion_value = 0u;
+    return true;
+}
 
 void DestroyRenoDXTaggedTargets()
 {
@@ -274,16 +388,20 @@ void DestroyRenoDXTaggedTargets()
     {
         for (auto& entry : s_renodxTaggedTargets)
         {
-            for (auto& target : entry.second.slots)
+            for (auto& targetSet : entry.second.formats)
             {
-                if (target.resource)
+                for (auto& target : targetSet.slots)
                 {
-                    s_renodxTaggedCompute->destroyResource(target.resource, 0u);
+                    if (target.resource)
+                    {
+                        s_renodxTaggedCompute->destroyResource(target.resource, 0u);
+                    }
                 }
             }
         }
     }
     s_renodxTaggedTargets.clear();
+    s_renodxTaggedViewports.clear();
     s_renodxTaggedCompute = nullptr;
 }
 
@@ -303,6 +421,7 @@ enum class RenoDXTaggedFrameResult
 #endif
 
 RenoDXTaggedFrameResult PrepareRenoDXTaggedFrame(
+    const sl::ViewportHandle& viewport,
     const sl::ResourceTag* tags,
     uint32_t numTags,
     sl::CommandBuffer* cmdBuffer,
@@ -386,21 +505,14 @@ RenoDXTaggedFrameResult PrepareRenoDXTaggedFrame(
         : s_renodxLegacyFrame++;
     const uint64_t targetKey = (static_cast<uint64_t>(source.width) << 32u)
         | static_cast<uint64_t>(source.height);
-    auto& targetSet = s_renodxTaggedTargets[targetKey];
-    if (targetSet.format != targetFormat)
-    {
-        for (auto& slot : targetSet.slots)
-        {
-            if (slot.resource)
-            {
-                compute->destroyResource(slot.resource, 0u);
-            }
-        }
-        targetSet = {};
-        targetSet.format = targetFormat;
-    }
+    auto& targetSet = s_renodxTaggedTargets[targetKey].formats[
+        targetFormat == sl::chi::Format::eFormatRGB10A2UN ? 1u : 0u];
     auto& target = targetSet.slots[
         frameIndex % MAX_FRAMES_IN_FLIGHT];
+    if (!SynchronizeRenoDXTaggedTarget(compute, &target))
+    {
+        return RenoDXTaggedFrameResult::eFailed;
+    }
     if (!target.resource)
     {
         const auto flags = sl::chi::ResourceFlags::eShaderResource
@@ -470,6 +582,8 @@ RenoDXTaggedFrameResult PrepareRenoDXTaggedFrame(
 
     adjustedTags->assign(tags, tags + numTags);
     (*adjustedTags)[colorIndex].resource = target.resource;
+    s_renodxTaggedViewports[
+        static_cast<uint32_t>(viewport)].pending_target = &target;
     RENODX_TAG_LOG_INFO_ONCE("[RenoDX][tag-handoff-v63] Replaced Endfield's color tag with the RenoDX display-encoded frame");
     return RenoDXTaggedFrameResult::eConverted;
 }
@@ -617,6 +731,31 @@ sl::Result slInit(const Preferences &pref, uint64_t sdkVersion)
     SL_EXCEPTION_HANDLE_END_RETURN(Result::eErrorExceptionHandler)
 }
 
+void renodx::streamline_bridge::OnVulkanHostPresent() noexcept
+{
+    std::lock_guard lock(s_renodxTaggedTargetMutex);
+    for (auto& entry : s_renodxTaggedViewports)
+    {
+        RenoDXTaggedViewport& viewport = entry.second;
+        if (!viewport.pending_target)
+        {
+            continue;
+        }
+        if (viewport.dlssg_enabled)
+        {
+            viewport.pending_target->awaiting_completion_fence = true;
+            viewport.presented_targets.push_back(viewport.pending_target);
+        }
+        else
+        {
+            viewport.pending_target->completion_fence = nullptr;
+            viewport.pending_target->completion_value = 0u;
+            viewport.pending_target->awaiting_completion_fence = false;
+        }
+        viewport.pending_target = nullptr;
+    }
+}
+
 Result slShutdown()
 {
     SL_EXCEPTION_HANDLE_START;
@@ -696,7 +835,7 @@ Result slSetTagCommonImpl(const sl::ViewportHandle& viewport, const sl::Resource
     if (!tags || numTags == 0) return Result::eErrorInvalidParameter;
     std::vector<sl::ResourceTag> adjustedTags;
     const sl::ResourceTag* effectiveTags = tags;
-    const auto renodxTagResult = PrepareRenoDXTaggedFrame(tags, numTags,
+    const auto renodxTagResult = PrepareRenoDXTaggedFrame(viewport, tags, numTags,
         cmdBuffer, useResourceTaggingForFrame, frame, &adjustedTags);
     if (renodxTagResult == RenoDXTaggedFrameResult::eFailed)
     {
