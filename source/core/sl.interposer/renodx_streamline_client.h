@@ -26,15 +26,14 @@ struct SwapchainInfo {
     uint32_t height{};
     uint32_t format{};
     std::vector<VkImage> images;
-    std::chrono::steady_clock::time_point registration_ready_at{};
-    bool registration_in_progress{};
 };
 
 inline std::mutex mutex;
 inline std::unordered_map<uint64_t, SwapchainInfo> swapchains;
 inline std::unordered_map<uint64_t, ImageInfo> images;
 inline bool initial_registration_complete{};
-inline bool initial_registration_in_progress{};
+inline bool registration_in_progress{};
+inline std::chrono::steady_clock::time_point initial_registration_ready_at{};
 inline PFN_vkGetDeviceProcAddr native_get_device_proc_addr{};
 inline std::atomic<renodx::streamline_bridge::ManageVulkanClientImageV1>
     manage_client_image{};
@@ -224,19 +223,16 @@ inline void OnGetSwapchainImages(
         }
         const std::vector<VkImage> queried_images(
             swapchain_images, swapchain_images + image_count);
-        if (found->second.images != queried_images)
+        found->second.images = queried_images;
+        if (initial_registration_ready_at
+            == std::chrono::steady_clock::time_point{})
         {
-            found->second.images = queried_images;
-            if (!initial_registration_complete)
-            {
-                found->second.registration_ready_at =
-                    std::chrono::steady_clock::now()
-                    + std::chrono::milliseconds(500);
-            }
+            initial_registration_ready_at =
+                std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(500);
         }
         info = found->second;
-        if (initial_registration_complete
-            && !found->second.registration_in_progress)
+        if (initial_registration_complete && !registration_in_progress)
         {
             for (const VkImage image : found->second.images)
             {
@@ -245,7 +241,7 @@ inline void OnGetSwapchainImages(
                     pending_images.push_back(image);
                 }
             }
-            found->second.registration_in_progress = !pending_images.empty();
+            registration_in_progress = !pending_images.empty();
         }
     }
 
@@ -253,11 +249,7 @@ inline void OnGetSwapchainImages(
     {
         RegisterClientImages(info, pending_images);
         std::lock_guard<std::mutex> lock(mutex);
-        const auto found = swapchains.find(Handle(swapchain));
-        if (found != swapchains.end())
-        {
-            found->second.registration_in_progress = false;
-        }
+        registration_in_progress = false;
     }
 }
 
@@ -279,13 +271,25 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         const auto image_found = images.find(Handle(image));
         if (image_found == images.end())
         {
-            if (found->second.registration_in_progress
-                || initial_registration_in_progress
-                || (!initial_registration_complete
-                    && std::chrono::steady_clock::now()
-                        < found->second.registration_ready_at))
+            if (registration_in_progress)
             {
                 return;
+            }
+            if (!initial_registration_complete)
+            {
+                if (initial_registration_ready_at
+                    == std::chrono::steady_clock::time_point{})
+                {
+                    initial_registration_ready_at =
+                        std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(500);
+                }
+                if (std::chrono::steady_clock::now()
+                    < initial_registration_ready_at)
+                {
+                    return;
+                }
+                completes_initial_registration = true;
             }
             for (const VkImage candidate : found->second.images)
             {
@@ -295,12 +299,7 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
                 }
             }
             pending_swapchain = found->second;
-            found->second.registration_in_progress = true;
-            if (!initial_registration_complete)
-            {
-                initial_registration_in_progress = true;
-                completes_initial_registration = true;
-            }
+            registration_in_progress = true;
         }
         else
         {
@@ -313,14 +312,9 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         const bool registered =
             RegisterClientImages(pending_swapchain, pending_images);
         std::lock_guard<std::mutex> lock(mutex);
-        const auto swapchain_found = swapchains.find(Handle(swapchain));
-        if (swapchain_found != swapchains.end())
-        {
-            swapchain_found->second.registration_in_progress = false;
-        }
+        registration_in_progress = false;
         if (completes_initial_registration)
         {
-            initial_registration_in_progress = false;
             initial_registration_complete = registered;
         }
         if (!registered)
@@ -402,26 +396,6 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
     return false;
 }
 
-inline void ConvertDisplay(VkCommandBuffer command_buffer, VkImage image)
-{
-    const auto manager = GetManager();
-    if (!manager || !manager(
-            renodx::streamline_bridge::kAbiVersion,
-            renodx::streamline_bridge::kClientImageOperationConvertDisplay,
-            Handle(command_buffer),
-            Handle(image),
-            0u,
-            0u,
-            0u))
-    {
-        return;
-    }
-    static std::once_flag logged;
-    std::call_once(logged, [] {
-        SL_LOG_INFO("[RenoDX][display-output] Copied the generated frame into the physical swapchain image on DLSS-G's command buffer");
-    });
-}
-
 inline void VKAPI_CALL CmdPipelineBarrier(
     VkCommandBuffer command_buffer,
     VkPipelineStageFlags source_stage,
@@ -463,16 +437,6 @@ inline void VKAPI_CALL CmdPipelineBarrier(
         image_memory_barrier_count,
         rewritten.empty() ? image_memory_barriers : rewritten.data());
 
-    for (uint32_t i = 0u;
-        image_memory_barriers && i < image_memory_barrier_count;
-        ++i)
-    {
-        if (image_memory_barriers[i].newLayout
-            == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
-        {
-            ConvertDisplay(command_buffer, image_memory_barriers[i].image);
-        }
-    }
 }
 
 inline void VKAPI_CALL CmdPipelineBarrier2(
@@ -513,20 +477,6 @@ inline void VKAPI_CALL CmdPipelineBarrier2(
         command_buffer,
         rewritten.empty() ? dependency_info : &rewritten_dependency);
 
-    if (dependency_info)
-    {
-        for (uint32_t i = 0u;
-            dependency_info->pImageMemoryBarriers
-                && i < dependency_info->imageMemoryBarrierCount;
-            ++i)
-        {
-            const auto& barrier = dependency_info->pImageMemoryBarriers[i];
-            if (barrier.newLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
-            {
-                ConvertDisplay(command_buffer, barrier.image);
-            }
-        }
-    }
 }
 
 
