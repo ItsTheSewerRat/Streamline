@@ -36,4 +36,6 @@ using SetVulkanDLSSGActiveV1 = uint32_t(__cdecl*)(
     uint32_t abi_version,
     uint32_t active) noexcept;
 
+void OnVulkanHostPresent() noexcept;
+
 }  // namespace renodx::streamline_bridge
