@@ -11,14 +11,6 @@ constexpr uint32_t kClientImageOperationConvert = 3u;
 
 using IsHDR10EnabledV1 = uint32_t(__cdecl*)() noexcept;
 using GetVulkanOutputFormatV1 = uint32_t(__cdecl*)() noexcept;
-using ConvertVulkanTaggedResourceV1 = uint32_t(__cdecl*)(
-    uint32_t abi_version,
-    uint64_t command_buffer,
-    uint64_t source_image_view,
-    uint64_t target_image_view,
-    uint32_t width,
-    uint32_t height) noexcept;
-
 using ManageVulkanClientImageV1 = uint32_t(__cdecl*)(
     uint32_t abi_version,
     uint32_t operation,
@@ -35,7 +27,5 @@ using SetVulkanDisplayReadyPQPresentV1 = uint32_t(__cdecl*)(
 using SetVulkanDLSSGActiveV1 = uint32_t(__cdecl*)(
     uint32_t abi_version,
     uint32_t active) noexcept;
-
-void OnVulkanHostPresent() noexcept;
 
 }  // namespace renodx::streamline_bridge

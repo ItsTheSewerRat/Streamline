@@ -2233,7 +2233,6 @@ extern "C"
                 if (feature == sl::kFeatureDLSS_G)
                 {
                     renodx::streamline_client::EndOuterPresentHook();
-                    renodx::streamline_bridge::OnVulkanHostPresent();
                 }
                 // report error on first fail
                 if (result != VK_SUCCESS)
