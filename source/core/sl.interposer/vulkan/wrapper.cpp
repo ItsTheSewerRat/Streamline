@@ -2085,6 +2085,10 @@ extern "C"
 
     VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfoKHR* CreateInfo, const VkAllocationCallbacks* Allocator, VkSwapchainKHR* Swapchain)
     {
+        using namespace renodx::streamline_diagnostics;
+        Announce();
+        const uint64_t event = NextSequence();
+        const auto start = Clock::now();
         VkSwapchainCreateInfoKHR renodxCreateInfo{};
         const VkSwapchainCreateInfoKHR* effectiveCreateInfo = CreateInfo;
         if (CreateInfo && renodxVulkanHDR10Active())
@@ -2096,6 +2100,28 @@ extern "C"
                 VK_COLOR_SPACE_HDR10_ST2084_EXT;
             effectiveCreateInfo = &renodxCreateInfo;
         }
+        ArmDetailedTrace();
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu createSwapchain.begin device=0x%llx surface=0x%llx oldSwapchain=0x%llx requestedFormat=%u requestedColorSpace=%u effectiveFormat=%u effectiveColorSpace=%u extent=%ux%u minImages=%u presentMode=%u usage=0x%x",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(
+                renodx::streamline_client::Handle(Device)),
+            static_cast<unsigned long long>(CreateInfo
+                ? renodx::streamline_client::Handle(CreateInfo->surface) : 0u),
+            static_cast<unsigned long long>(CreateInfo
+                ? renodx::streamline_client::Handle(CreateInfo->oldSwapchain) : 0u),
+            CreateInfo ? static_cast<uint32_t>(CreateInfo->imageFormat) : UINT32_MAX,
+            CreateInfo ? static_cast<uint32_t>(CreateInfo->imageColorSpace) : UINT32_MAX,
+            effectiveCreateInfo
+                ? static_cast<uint32_t>(effectiveCreateInfo->imageFormat) : UINT32_MAX,
+            effectiveCreateInfo
+                ? static_cast<uint32_t>(effectiveCreateInfo->imageColorSpace) : UINT32_MAX,
+            effectiveCreateInfo ? effectiveCreateInfo->imageExtent.width : 0u,
+            effectiveCreateInfo ? effectiveCreateInfo->imageExtent.height : 0u,
+            effectiveCreateInfo ? effectiveCreateInfo->minImageCount : 0u,
+            effectiveCreateInfo
+                ? static_cast<uint32_t>(effectiveCreateInfo->presentMode) : UINT32_MAX,
+            effectiveCreateInfo ? effectiveCreateInfo->imageUsage : 0u);
 
         bool skip = false;
         VkResult result = VK_SUCCESS;
@@ -2103,11 +2129,28 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_CreateSwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu createSwapchain.beforeHook.begin feature=%u skip=%u",
+                    static_cast<unsigned long long>(event), feature, skip ? 1u : 0u);
                 result = ((sl::PFunVkCreateSwapchainKHRBefore*)hook)(Device,
                     feature == sl::kFeatureDLSS_G ? effectiveCreateInfo : CreateInfo,
                     Allocator, Swapchain, skip);
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu createSwapchain.beforeHook.end feature=%u result=%d skip=%u swapchain=0x%llx",
+                    static_cast<unsigned long long>(event),
+                    feature,
+                    static_cast<int32_t>(result),
+                    skip ? 1u : 0u,
+                    static_cast<unsigned long long>(
+                        Swapchain && *Swapchain
+                            ? renodx::streamline_client::Handle(*Swapchain) : 0u));
                 if (result != VK_SUCCESS)
                 {
+                    SL_LOG_ERROR(
+                        "[RenoDX][diag-v1] #%llu createSwapchain.end stage=beforeHook result=%d durationUs=%llu",
+                        static_cast<unsigned long long>(event),
+                        static_cast<int32_t>(result),
+                        static_cast<unsigned long long>(ElapsedMicros(start)));
                     return result;
                 }
             }
@@ -2115,8 +2158,18 @@ extern "C"
 
         if (!skip)
         {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu createSwapchain.native.begin",
+                static_cast<unsigned long long>(event));
             result = s_ddt.CreateSwapchainKHR(
                 Device, effectiveCreateInfo, Allocator, Swapchain);
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu createSwapchain.native.end result=%d swapchain=0x%llx",
+                static_cast<unsigned long long>(event),
+                static_cast<int32_t>(result),
+                static_cast<unsigned long long>(
+                    Swapchain && *Swapchain
+                        ? renodx::streamline_client::Handle(*Swapchain) : 0u));
         }
 
         if (result == VK_SUCCESS && Swapchain && *Swapchain)
@@ -2129,38 +2182,91 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getAfterHooks(sl::FunctionHookID::eVulkan_CreateSwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu createSwapchain.afterHook.begin feature=%u",
+                    static_cast<unsigned long long>(event), feature);
                 result = ((sl::PFunVkCreateSwapchainKHRAfter*)hook)(Device,
                     feature == sl::kFeatureDLSS_G ? effectiveCreateInfo : CreateInfo,
                     Allocator, Swapchain);
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu createSwapchain.afterHook.end feature=%u result=%d",
+                    static_cast<unsigned long long>(event),
+                    feature,
+                    static_cast<int32_t>(result));
                 if (result != VK_SUCCESS)
                 {
+                    SL_LOG_ERROR(
+                        "[RenoDX][diag-v1] #%llu createSwapchain.end stage=afterHook result=%d durationUs=%llu",
+                        static_cast<unsigned long long>(event),
+                        static_cast<int32_t>(result),
+                        static_cast<unsigned long long>(ElapsedMicros(start)));
                     return result;
                 }
             }
         }
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu createSwapchain.end result=%d skip=%u swapchain=0x%llx durationUs=%llu",
+            static_cast<unsigned long long>(event),
+            static_cast<int32_t>(result),
+            skip ? 1u : 0u,
+            static_cast<unsigned long long>(
+                Swapchain && *Swapchain
+                    ? renodx::streamline_client::Handle(*Swapchain) : 0u),
+            static_cast<unsigned long long>(ElapsedMicros(start)));
         return result;
     }
 
     void VKAPI_CALL vkDestroySwapchainKHR(VkDevice Device, VkSwapchainKHR Swapchain, const VkAllocationCallbacks* Allocator)
     {
+        using namespace renodx::streamline_diagnostics;
+        const uint64_t event = NextSequence();
+        const auto start = Clock::now();
+        ArmDetailedTrace();
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu destroySwapchain.begin device=0x%llx swapchain=0x%llx",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(
+                renodx::streamline_client::Handle(Device)),
+            static_cast<unsigned long long>(
+                renodx::streamline_client::Handle(Swapchain)));
         bool skip = false;
         {
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_DestroySwapchainKHR);
             for (auto [hook, feature] : hooks)
             {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu destroySwapchain.beforeHook.begin feature=%u skip=%u",
+                    static_cast<unsigned long long>(event), feature, skip ? 1u : 0u);
                 ((sl::PFunVkDestroySwapchainKHRBefore*)hook)(Device, Swapchain, Allocator, skip);
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu destroySwapchain.beforeHook.end feature=%u skip=%u",
+                    static_cast<unsigned long long>(event), feature, skip ? 1u : 0u);
             }
         }
 
         if (!skip)
         {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu destroySwapchain.native.begin",
+                static_cast<unsigned long long>(event));
             s_ddt.DestroySwapchainKHR(Device, Swapchain, Allocator);
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu destroySwapchain.native.end",
+                static_cast<unsigned long long>(event));
         }
         renodx::streamline_client::OnDestroySwapchain(Swapchain);
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu destroySwapchain.end skip=%u durationUs=%llu",
+            static_cast<unsigned long long>(event),
+            skip ? 1u : 0u,
+            static_cast<unsigned long long>(ElapsedMicros(start)));
     }
 
     VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice Device, VkSwapchainKHR Swapchain, uint32_t* SwapchainImageCount, VkImage* SwapchainImages)
     {
+        using namespace renodx::streamline_diagnostics;
+        const uint64_t event = NextSequence();
+        const auto start = Clock::now();
         bool skip = false;
         VkResult result = VK_SUCCESS;
         {
@@ -2170,6 +2276,13 @@ extern "C"
                 result = ((sl::PFunVkGetSwapchainImagesKHRBefore*)hook)(Device, Swapchain, SwapchainImageCount, SwapchainImages, skip);
                 if (result != VK_SUCCESS)
                 {
+                    SL_LOG_ERROR(
+                        "[RenoDX][diag-v1] #%llu getSwapchainImages.end stage=beforeHook result=%d count=%u hasImages=%u durationUs=%llu",
+                        static_cast<unsigned long long>(event),
+                        static_cast<int32_t>(result),
+                        SwapchainImageCount ? *SwapchainImageCount : 0u,
+                        SwapchainImages ? 1u : 0u,
+                        static_cast<unsigned long long>(ElapsedMicros(start)));
                     return result;
                 }
             }
@@ -2185,21 +2298,87 @@ extern "C"
             renodx::streamline_client::OnGetSwapchainImages(
                 Swapchain, *SwapchainImageCount, SwapchainImages);
         }
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu getSwapchainImages.end swapchain=0x%llx result=%d skip=%u count=%u hasImages=%u first=0x%llx durationUs=%llu",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(
+                renodx::streamline_client::Handle(Swapchain)),
+            static_cast<int32_t>(result),
+            skip ? 1u : 0u,
+            SwapchainImageCount ? *SwapchainImageCount : 0u,
+            SwapchainImages ? 1u : 0u,
+            static_cast<unsigned long long>(
+                SwapchainImages && SwapchainImageCount
+                    && *SwapchainImageCount != 0u
+                    ? renodx::streamline_client::Handle(SwapchainImages[0]) : 0u),
+            static_cast<unsigned long long>(ElapsedMicros(start)));
         return result;
     }
 
     VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice Device, VkSwapchainKHR Swapchain, uint64_t Timeout, VkSemaphore Semaphore, VkFence Fence, uint32_t* ImageIndex)
     {
+        using namespace renodx::streamline_diagnostics;
+        Announce();
+        ObserveForeground("acquire");
+        const uint64_t call = acquire_calls.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+        const bool heartbeat = call % 300u == 0u;
+        const bool trace = TakeDetailedTrace() || heartbeat;
+        const uint64_t event = trace ? NextSequence() : 0u;
+        const auto start = Clock::now();
+        if (trace)
+        {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu acquire.begin call=%llu device=0x%llx swapchain=0x%llx timeout=%llu semaphore=0x%llx fence=0x%llx",
+                static_cast<unsigned long long>(event),
+                static_cast<unsigned long long>(call),
+                static_cast<unsigned long long>(
+                    renodx::streamline_client::Handle(Device)),
+                static_cast<unsigned long long>(
+                    renodx::streamline_client::Handle(Swapchain)),
+                static_cast<unsigned long long>(Timeout),
+                static_cast<unsigned long long>(
+                    renodx::streamline_client::Handle(Semaphore)),
+                static_cast<unsigned long long>(
+                    renodx::streamline_client::Handle(Fence)));
+        }
         bool skip = false;
         VkResult result = VK_SUCCESS;
         {
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(sl::FunctionHookID::eVulkan_AcquireNextImageKHR);
             for (auto [hook, feature] : hooks)
             {
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu acquire.beforeHook.begin call=%llu feature=%u skip=%u",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        skip ? 1u : 0u);
+                }
                 result = ((sl::PFunVkAcquireNextImageKHRBefore*)hook)(Device, Swapchain, Timeout, Semaphore, Fence, ImageIndex, skip);
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu acquire.beforeHook.end call=%llu feature=%u result=%d skip=%u image=%u",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        static_cast<int32_t>(result),
+                        skip ? 1u : 0u,
+                        ImageIndex ? *ImageIndex : UINT32_MAX);
+                }
                 // report error on first fail
                 if (result != VK_SUCCESS)
                 {
+                    SL_LOG_ERROR(
+                        "[RenoDX][diag-v1] #%llu acquire.end call=%llu stage=beforeHook feature=%u result=%d durationUs=%llu",
+                        static_cast<unsigned long long>(trace ? event : NextSequence()),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        static_cast<int32_t>(result),
+                        static_cast<unsigned long long>(ElapsedMicros(start)));
                     return result;
                 }
             }
@@ -2207,17 +2386,94 @@ extern "C"
 
         if (!skip)
         {
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu acquire.native.begin call=%llu",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(call));
+            }
             result = s_ddt.AcquireNextImageKHR(Device, Swapchain, Timeout, Semaphore, Fence, ImageIndex);
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu acquire.native.end call=%llu result=%d image=%u",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(call),
+                    static_cast<int32_t>(result),
+                    ImageIndex ? *ImageIndex : UINT32_MAX);
+            }
         }
         if (ImageIndex && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
         {
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu acquire.client.begin call=%llu image=%u",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(call),
+                    *ImageIndex);
+            }
             renodx::streamline_client::OnAcquire(Swapchain, *ImageIndex);
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu acquire.client.end call=%llu image=%u",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(call),
+                    *ImageIndex);
+            }
+        }
+        const uint64_t duration = ElapsedMicros(start);
+        if (trace || (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+            || duration >= 50000u)
+        {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu acquire.end call=%llu result=%d skip=%u image=%u durationUs=%llu",
+                static_cast<unsigned long long>(trace ? event : NextSequence()),
+                static_cast<unsigned long long>(call),
+                static_cast<int32_t>(result),
+                skip ? 1u : 0u,
+                ImageIndex ? *ImageIndex : UINT32_MAX,
+                static_cast<unsigned long long>(duration));
+        }
+        if (heartbeat)
+        {
+            LogHeartbeat("acquire", call);
         }
         return result;
     }
 
     VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentInfo)
     {
+        using namespace renodx::streamline_diagnostics;
+        Announce();
+        ObserveForeground("host-present");
+        const uint64_t call = host_present_calls.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+        const bool heartbeat = call % 300u == 0u;
+        const bool trace = TakeDetailedTrace() || heartbeat;
+        const uint64_t event = trace ? NextSequence() : 0u;
+        const auto start = Clock::now();
+        if (trace)
+        {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu hostPresent.begin call=%llu queue=0x%llx waits=%u swapchains=%u firstSwapchain=0x%llx firstImage=%u",
+                static_cast<unsigned long long>(event),
+                static_cast<unsigned long long>(call),
+                static_cast<unsigned long long>(
+                    renodx::streamline_client::Handle(Queue)),
+                PresentInfo ? PresentInfo->waitSemaphoreCount : 0u,
+                PresentInfo ? PresentInfo->swapchainCount : 0u,
+                static_cast<unsigned long long>(
+                    PresentInfo && PresentInfo->swapchainCount != 0u
+                        && PresentInfo->pSwapchains
+                        ? renodx::streamline_client::Handle(
+                            PresentInfo->pSwapchains[0]) : 0u),
+                PresentInfo && PresentInfo->swapchainCount != 0u
+                        && PresentInfo->pImageIndices
+                    ? PresentInfo->pImageIndices[0] : UINT32_MAX);
+        }
         bool skip = false;
         VkResult result = VK_SUCCESS;
         auto hooksId = sl::FunctionHookID::eVulkan_Present;
@@ -2225,6 +2481,15 @@ extern "C"
             const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(hooksId);
             for (auto [hook, feature] : hooks)
             {
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu hostPresent.beforeHook.begin call=%llu feature=%u skip=%u",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        skip ? 1u : 0u);
+                }
                 if (feature == sl::kFeatureDLSS_G)
                 {
                     renodx::streamline_client::BeginOuterPresentHook();
@@ -2234,9 +2499,26 @@ extern "C"
                 {
                     renodx::streamline_client::EndOuterPresentHook();
                 }
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu hostPresent.beforeHook.end call=%llu feature=%u result=%d skip=%u",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        static_cast<int32_t>(result),
+                        skip ? 1u : 0u);
+                }
                 // report error on first fail
                 if (result != VK_SUCCESS)
                 {
+                    SL_LOG_ERROR(
+                        "[RenoDX][diag-v1] #%llu hostPresent.end call=%llu stage=beforeHook feature=%u result=%d durationUs=%llu",
+                        static_cast<unsigned long long>(trace ? event : NextSequence()),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        static_cast<int32_t>(result),
+                        static_cast<unsigned long long>(ElapsedMicros(start)));
                     return result;
                 }
             }
@@ -2244,20 +2526,74 @@ extern "C"
 
         if (!skip)
         {
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu hostPresent.native.begin call=%llu",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(call));
+            }
             result = s_ddt.QueuePresentKHR(Queue, PresentInfo);
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu hostPresent.native.end call=%llu result=%d",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(call),
+                    static_cast<int32_t>(result));
+            }
         }
 
         {
             const auto& hooks = sl::plugin_manager::getInterface()->getAfterHooks(hooksId);
             for (auto [hook, feature] : hooks)
             {
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu hostPresent.afterHook.begin call=%llu feature=%u",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(call),
+                        feature);
+                }
                 result = ((sl::PFunVkQueuePresentKHRAfter*)hook)();
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu hostPresent.afterHook.end call=%llu feature=%u result=%d",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        static_cast<int32_t>(result));
+                }
                 // report error on first fail
                 if (result != VK_SUCCESS)
                 {
+                    SL_LOG_ERROR(
+                        "[RenoDX][diag-v1] #%llu hostPresent.end call=%llu stage=afterHook feature=%u result=%d durationUs=%llu",
+                        static_cast<unsigned long long>(trace ? event : NextSequence()),
+                        static_cast<unsigned long long>(call),
+                        feature,
+                        static_cast<int32_t>(result),
+                        static_cast<unsigned long long>(ElapsedMicros(start)));
                     return result;
                 }
             }
+        }
+        const uint64_t duration = ElapsedMicros(start);
+        if (trace || result != VK_SUCCESS || duration >= 50000u)
+        {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu hostPresent.end call=%llu result=%d skip=%u durationUs=%llu",
+                static_cast<unsigned long long>(trace ? event : NextSequence()),
+                static_cast<unsigned long long>(call),
+                static_cast<int32_t>(result),
+                skip ? 1u : 0u,
+                static_cast<unsigned long long>(duration));
+        }
+        if (heartbeat)
+        {
+            LogHeartbeat("host-present", call);
         }
         return result;
     }

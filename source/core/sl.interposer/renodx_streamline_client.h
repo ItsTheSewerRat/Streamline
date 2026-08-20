@@ -11,6 +11,7 @@
 #include <Windows.h>
 
 #include "source/core/sl.interposer/renodx_streamline_bridge.h"
+#include "source/core/sl.interposer/renodx_streamline_diagnostics.h"
 
 namespace renodx::streamline_client {
 
@@ -118,6 +119,14 @@ inline bool RegisterClientImages(
             registered_all = false;
             continue;
         }
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu client.register image=0x%llx size=%ux%u format=%u",
+            static_cast<unsigned long long>(
+                streamline_diagnostics::NextSequence()),
+            static_cast<unsigned long long>(Handle(image)),
+            image_info.width,
+            image_info.height,
+            image_info.format);
         static std::once_flag logged;
         std::call_once(logged, [] {
             SL_LOG_INFO("[RenoDX][client-fp16] Registered SDR/HDR10 Streamline client images with FP16 clones");
@@ -185,6 +194,15 @@ inline void OnCreateSwapchain(
         static_cast<uint32_t>(create_info.imageFormat),
         {},
     };
+    streamline_diagnostics::ArmDetailedTrace();
+    SL_LOG_INFO(
+        "[RenoDX][diag-v1] #%llu client.swapchain.create swapchain=0x%llx size=%ux%u format=%u",
+        static_cast<unsigned long long>(
+            streamline_diagnostics::NextSequence()),
+        static_cast<unsigned long long>(Handle(swapchain)),
+        create_info.imageExtent.width,
+        create_info.imageExtent.height,
+        static_cast<uint32_t>(create_info.imageFormat));
 }
 
 inline void OnDestroySwapchain(VkSwapchainKHR swapchain)
@@ -193,13 +211,26 @@ inline void OnDestroySwapchain(VkSwapchainKHR swapchain)
     const auto found = swapchains.find(Handle(swapchain));
     if (found == swapchains.end())
     {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu client.swapchain.destroy swapchain=0x%llx tracked=0",
+            static_cast<unsigned long long>(
+                streamline_diagnostics::NextSequence()),
+            static_cast<unsigned long long>(Handle(swapchain)));
         return;
     }
+    const size_t image_count = found->second.images.size();
     for (const VkImage image : found->second.images)
     {
         images.erase(Handle(image));
     }
     swapchains.erase(found);
+    streamline_diagnostics::ArmDetailedTrace();
+    SL_LOG_INFO(
+        "[RenoDX][diag-v1] #%llu client.swapchain.destroy swapchain=0x%llx tracked=1 images=%llu",
+        static_cast<unsigned long long>(
+            streamline_diagnostics::NextSequence()),
+        static_cast<unsigned long long>(Handle(swapchain)),
+        static_cast<unsigned long long>(image_count));
 }
 
 inline void OnGetSwapchainImages(
@@ -211,6 +242,14 @@ inline void OnGetSwapchainImages(
     {
         return;
     }
+
+    SL_LOG_INFO(
+        "[RenoDX][diag-v1] #%llu client.swapchain.images swapchain=0x%llx count=%u first=0x%llx",
+        static_cast<unsigned long long>(
+            streamline_diagnostics::NextSequence()),
+        static_cast<unsigned long long>(Handle(swapchain)),
+        image_count,
+        static_cast<unsigned long long>(Handle(swapchain_images[0])));
 
     SwapchainInfo info{};
     std::vector<VkImage> pending_images;
@@ -255,6 +294,18 @@ inline void OnGetSwapchainImages(
 
 inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
 {
+    const bool trace = streamline_diagnostics::TakeDetailedTrace();
+    const uint64_t event = trace
+        ? streamline_diagnostics::NextSequence() : 0u;
+    const auto start = streamline_diagnostics::Clock::now();
+    if (trace)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu client.acquire.begin swapchain=0x%llx index=%u",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(Handle(swapchain)),
+            image_index);
+    }
     VkImage image{};
     ImageInfo info{};
     SwapchainInfo pending_swapchain{};
@@ -265,6 +316,14 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         const auto found = swapchains.find(Handle(swapchain));
         if (found == swapchains.end() || image_index >= found->second.images.size())
         {
+            if (trace)
+            {
+                SL_LOG_INFO(
+                    "[RenoDX][diag-v1] #%llu client.acquire.end tracked=0 durationUs=%llu",
+                    static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(
+                        streamline_diagnostics::ElapsedMicros(start)));
+            }
             return;
         }
         image = found->second.images[image_index];
@@ -273,6 +332,15 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         {
             if (registration_in_progress)
             {
+                if (trace)
+                {
+                    SL_LOG_INFO(
+                        "[RenoDX][diag-v1] #%llu client.acquire.end registrationInProgress=1 image=0x%llx durationUs=%llu",
+                        static_cast<unsigned long long>(event),
+                        static_cast<unsigned long long>(Handle(image)),
+                        static_cast<unsigned long long>(
+                            streamline_diagnostics::ElapsedMicros(start)));
+                }
                 return;
             }
             if (!initial_registration_complete)
@@ -287,6 +355,10 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
                 if (std::chrono::steady_clock::now()
                     < initial_registration_ready_at)
                 {
+                    static std::once_flag delay_logged;
+                    std::call_once(delay_logged, [] {
+                        SL_LOG_INFO("[RenoDX][diag-v1] Initial client-image registration guard started for 500 ms");
+                    });
                     return;
                 }
                 completes_initial_registration = true;
@@ -319,11 +391,21 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         }
         if (!registered)
         {
+            SL_LOG_ERROR(
+                "[RenoDX][diag-v1] #%llu client.acquire.end registrationFailed=1 image=0x%llx",
+                static_cast<unsigned long long>(
+                    streamline_diagnostics::NextSequence()),
+                static_cast<unsigned long long>(Handle(image)));
             return;
         }
         const auto image_found = images.find(Handle(image));
         if (image_found == images.end())
         {
+            SL_LOG_ERROR(
+                "[RenoDX][diag-v1] #%llu client.acquire.end registeredImageMissing=1 image=0x%llx",
+                static_cast<unsigned long long>(
+                    streamline_diagnostics::NextSequence()),
+                static_cast<unsigned long long>(Handle(image)));
             return;
         }
         info = image_found->second;
@@ -336,14 +418,25 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
         }
     }
 
-    if (!Manage(
+    const uint64_t activation = streamline_diagnostics::activation_calls.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    const bool activated = Manage(
             renodx::streamline_bridge::kClientImageOperationActivate,
             nullptr,
             image,
-            info))
+            info);
+    const uint64_t duration = streamline_diagnostics::ElapsedMicros(start);
+    if (!activated)
     {
         SL_LOG_ERROR("[RenoDX][client-fp16] Failed to activate client image 0x%llx",
             static_cast<unsigned long long>(Handle(image)));
+        SL_LOG_ERROR(
+            "[RenoDX][diag-v1] #%llu client.acquire.end activation=%llu activated=0 image=0x%llx durationUs=%llu",
+            static_cast<unsigned long long>(
+                streamline_diagnostics::NextSequence()),
+            static_cast<unsigned long long>(activation),
+            static_cast<unsigned long long>(Handle(image)),
+            static_cast<unsigned long long>(duration));
         return;
     }
     static std::once_flag logged;
@@ -355,6 +448,19 @@ inline void OnAcquire(VkSwapchainKHR swapchain, uint32_t image_index)
     if (found != images.end())
     {
         found->second.active = true;
+    }
+    if (trace || duration >= 50000u)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu client.acquire.end activation=%llu activated=1 image=0x%llx size=%ux%u format=%u durationUs=%llu",
+            static_cast<unsigned long long>(
+                trace ? event : streamline_diagnostics::NextSequence()),
+            static_cast<unsigned long long>(activation),
+            static_cast<unsigned long long>(Handle(image)),
+            info.width,
+            info.height,
+            info.format,
+            static_cast<unsigned long long>(duration));
     }
 }
 
@@ -372,6 +478,25 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
         found->second.active = false;
     }
 
+    const uint64_t conversion =
+        streamline_diagnostics::conversion_calls.fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+    const bool trace = streamline_diagnostics::TakeDetailedTrace();
+    const uint64_t event = trace
+        ? streamline_diagnostics::NextSequence() : 0u;
+    const auto start = streamline_diagnostics::Clock::now();
+    if (trace)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu client.convert.begin conversion=%llu commandBuffer=0x%llx image=0x%llx size=%ux%u format=%u",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(conversion),
+            static_cast<unsigned long long>(Handle(command_buffer)),
+            static_cast<unsigned long long>(Handle(image)),
+            info.width,
+            info.height,
+            info.format);
+    }
     if (Manage(
             renodx::streamline_bridge::kClientImageOperationConvert,
             command_buffer,
@@ -382,6 +507,17 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
         std::call_once(logged, [] {
             SL_LOG_INFO("[RenoDX][client-fp16] Preserved the native frame in FP16 and encoded it for DLSS-G at the read barrier");
         });
+        const uint64_t duration =
+            streamline_diagnostics::ElapsedMicros(start);
+        if (trace || duration >= 50000u)
+        {
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu client.convert.end conversion=%llu converted=1 durationUs=%llu",
+                static_cast<unsigned long long>(
+                    trace ? event : streamline_diagnostics::NextSequence()),
+                static_cast<unsigned long long>(conversion),
+                static_cast<unsigned long long>(duration));
+        }
         return true;
     }
 
@@ -393,6 +529,13 @@ inline bool Convert(VkCommandBuffer command_buffer, VkImage image)
     }
     SL_LOG_ERROR("[RenoDX][client-fp16] Failed to convert client image 0x%llx",
         static_cast<unsigned long long>(Handle(image)));
+    SL_LOG_ERROR(
+        "[RenoDX][diag-v1] #%llu client.convert.end conversion=%llu converted=0 durationUs=%llu",
+        static_cast<unsigned long long>(
+            trace ? event : streamline_diagnostics::NextSequence()),
+        static_cast<unsigned long long>(conversion),
+        static_cast<unsigned long long>(
+            streamline_diagnostics::ElapsedMicros(start)));
     return false;
 }
 
@@ -484,7 +627,34 @@ inline VkResult VKAPI_CALL QueuePresent(
     VkQueue queue,
     const VkPresentInfoKHR* present_info)
 {
+    using namespace streamline_diagnostics;
+    Announce();
+    ObserveForeground("dlssg-present");
+    const uint64_t call = dlssg_present_calls.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    const bool trace = TakeDetailedTrace();
+    const uint64_t event = trace ? NextSequence() : 0u;
+    const auto start = Clock::now();
     const bool asynchronous = outer_present_hook_depth == 0u;
+    if (trace)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu dlssgPresent.begin call=%llu queue=0x%llx async=%u outerDepth=%u waits=%u swapchains=%u firstSwapchain=0x%llx firstImage=%u",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(call),
+            static_cast<unsigned long long>(Handle(queue)),
+            asynchronous ? 1u : 0u,
+            outer_present_hook_depth,
+            present_info ? present_info->waitSemaphoreCount : 0u,
+            present_info ? present_info->swapchainCount : 0u,
+            static_cast<unsigned long long>(
+                present_info && present_info->swapchainCount != 0u
+                    && present_info->pSwapchains
+                    ? Handle(present_info->pSwapchains[0]) : 0u),
+            present_info && present_info->swapchainCount != 0u
+                    && present_info->pImageIndices
+                ? present_info->pImageIndices[0] : UINT32_MAX);
+    }
     const bool marked = asynchronous && SetDisplayReadyPQPresent(true);
     if (asynchronous && !marked)
     {
@@ -494,14 +664,48 @@ inline VkResult VKAPI_CALL QueuePresent(
         });
     }
 
+    if (trace)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu dlssgPresent.native.begin call=%llu marked=%u",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(call),
+            marked ? 1u : 0u);
+    }
     const VkResult result = s_ddt.QueuePresentKHR(queue, present_info);
+    if (trace)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu dlssgPresent.native.end call=%llu result=%d",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(call),
+            static_cast<int32_t>(result));
+    }
 
-    if (marked && !SetDisplayReadyPQPresent(false))
+    const bool cleared = !marked || SetDisplayReadyPQPresent(false);
+    if (!cleared)
     {
         static std::once_flag logged;
         std::call_once(logged, [] {
             SL_LOG_ERROR("[RenoDX][client-fp16] Failed to clear DLSS-G display-ready present");
         });
+    }
+    const uint64_t duration = ElapsedMicros(start);
+    if (trace || result != VK_SUCCESS || duration >= 50000u)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu dlssgPresent.end call=%llu result=%d async=%u marked=%u cleared=%u durationUs=%llu",
+            static_cast<unsigned long long>(trace ? event : NextSequence()),
+            static_cast<unsigned long long>(call),
+            static_cast<int32_t>(result),
+            asynchronous ? 1u : 0u,
+            marked ? 1u : 0u,
+            cleared ? 1u : 0u,
+            static_cast<unsigned long long>(duration));
+    }
+    if (call % 300u == 0u)
+    {
+        LogHeartbeat("dlssg-present", call);
     }
     return result;
 }
@@ -512,6 +716,11 @@ inline PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(
 {
     if (name && strcmp(name, "vkQueuePresentKHR") == 0)
     {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            streamline_diagnostics::Announce();
+            SL_LOG_INFO("[RenoDX][diag-v1] DLSS-G requested the client-image present function");
+        });
         return reinterpret_cast<PFN_vkVoidFunction>(QueuePresent);
     }
     if (name && strcmp(name, "vkCmdPipelineBarrier") == 0)

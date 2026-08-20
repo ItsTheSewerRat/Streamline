@@ -47,6 +47,7 @@
 #include "source/core/sl.param/parameters.h"
 #include "source/core/sl.interposer/hook.h"
 #include "source/core/sl.interposer/renodx_streamline_bridge.h"
+#include "source/core/sl.interposer/renodx_streamline_diagnostics.h"
 #include "source/core/sl.plugin-manager/pluginManager.h"
 #include "source/platforms/sl.chi/compute.h"
 #include "include/sl_helpers.h"
@@ -199,6 +200,7 @@ void SetRenoDXAddonDLSSGActive(bool active)
 }
 
 PFun_slDLSSGSetOptions* s_renodxOriginalDLSSGSetOptions{};
+PFun_slDLSSGGetState* s_renodxOriginalDLSSGGetState{};
 
 sl::DLSSGOptions AdjustRenoDXDLSSGOptions(
     const sl::DLSSGOptions& options,
@@ -218,8 +220,18 @@ sl::Result RenoDXDLSSGSetOptions(
     const sl::ViewportHandle& viewport,
     const sl::DLSSGOptions& options)
 {
+    using namespace renodx::streamline_diagnostics;
+    Announce();
+    const uint64_t call = option_calls.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    const uint64_t event = NextSequence();
+    const auto start = Clock::now();
     if (!s_renodxOriginalDLSSGSetOptions)
     {
+        SL_LOG_ERROR(
+            "[RenoDX][diag-v1] #%llu setOptions call=%llu missing-original",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(call));
         return sl::Result::eErrorMissingOrInvalidAPI;
     }
     const uint32_t output_format = RenoDXAddonVulkanOutputFormat();
@@ -230,6 +242,39 @@ sl::Result RenoDXDLSSGSetOptions(
         adjusted_options = AdjustRenoDXDLSSGOptions(
             options, output_format);
     }
+    ArmDetailedTrace();
+    SL_LOG_INFO(
+        "[RenoDX][diag-v1] #%llu setOptions.begin call=%llu viewport=%u version=%u requestedMode=%u effectiveMode=%u frames=%u flags=0x%x dynamic=%ux%u backBuffers=%u mvecDepth=%ux%u color=%ux%u requestedColorFormat=%u effectiveColorFormat=%u mvecFormat=%u depthFormat=%u hudlessFormat=%u uiFormat=%u queueMode=%u uiRecomposition=%u dynamicTarget=%.3f",
+        static_cast<unsigned long long>(event),
+        static_cast<unsigned long long>(call),
+        static_cast<uint32_t>(viewport),
+        options.structVersion,
+        static_cast<uint32_t>(options.mode),
+        static_cast<uint32_t>(adjusted_options.mode),
+        adjusted_options.numFramesToGenerate,
+        static_cast<uint32_t>(adjusted_options.flags),
+        adjusted_options.dynamicResWidth,
+        adjusted_options.dynamicResHeight,
+        adjusted_options.numBackBuffers,
+        adjusted_options.mvecDepthWidth,
+        adjusted_options.mvecDepthHeight,
+        adjusted_options.colorWidth,
+        adjusted_options.colorHeight,
+        options.colorBufferFormat,
+        adjusted_options.colorBufferFormat,
+        adjusted_options.mvecBufferFormat,
+        adjusted_options.depthBufferFormat,
+        adjusted_options.hudLessBufferFormat,
+        adjusted_options.uiBufferFormat,
+        options.structVersion >= sl::kStructVersion3
+            ? static_cast<uint32_t>(adjusted_options.queueParallelismMode)
+            : UINT32_MAX,
+        options.structVersion >= sl::kStructVersion4
+            ? static_cast<uint32_t>(adjusted_options.enableUserInterfaceRecomposition)
+            : UINT32_MAX,
+        options.structVersion >= sl::kStructVersion5
+            ? adjusted_options.dynamicTargetFrameRate
+            : -1.0f);
     const sl::Result result = s_renodxOriginalDLSSGSetOptions(
         viewport, adjusted_options);
     if (result == sl::Result::eOk)
@@ -237,6 +282,74 @@ sl::Result RenoDXDLSSGSetOptions(
         SetRenoDXAddonDLSSGActive(
             adjusted_options.mode != sl::DLSSGMode::eOff
             && adjusted_options.numFramesToGenerate != 0u);
+    }
+    SL_LOG_INFO(
+        "[RenoDX][diag-v1] #%llu setOptions.end call=%llu result=%d active=%u durationUs=%llu",
+        static_cast<unsigned long long>(event),
+        static_cast<unsigned long long>(call),
+        static_cast<int32_t>(result),
+        result == sl::Result::eOk
+                && adjusted_options.mode != sl::DLSSGMode::eOff
+                && adjusted_options.numFramesToGenerate != 0u
+            ? 1u : 0u,
+        static_cast<unsigned long long>(ElapsedMicros(start)));
+    return result;
+}
+
+sl::Result RenoDXDLSSGGetState(
+    const sl::ViewportHandle& viewport,
+    sl::DLSSGState& state,
+    const sl::DLSSGOptions* options)
+{
+    using namespace renodx::streamline_diagnostics;
+    Announce();
+    const uint64_t call = state_calls.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    const bool trace = TakeDetailedTrace() || call % 256u == 0u;
+    const uint64_t event = trace ? NextSequence() : 0u;
+    const auto start = Clock::now();
+    if (!s_renodxOriginalDLSSGGetState)
+    {
+        SL_LOG_ERROR(
+            "[RenoDX][diag-v1] #%llu getState call=%llu missing-original",
+            static_cast<unsigned long long>(NextSequence()),
+            static_cast<unsigned long long>(call));
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    if (trace)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu getState.begin call=%llu viewport=%u stateVersion=%u options=%p optionsVersion=%u",
+            static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(call),
+            static_cast<uint32_t>(viewport),
+            state.structVersion,
+            options,
+            options ? options->structVersion : 0u);
+    }
+    const sl::Result result = s_renodxOriginalDLSSGGetState(
+        viewport, state, options);
+    const uint64_t duration = ElapsedMicros(start);
+    if (trace || result != sl::Result::eOk || duration >= 50000u)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu getState.end call=%llu result=%d status=0x%x presented=%u maxGenerated=%u estimatedVram=%llu minDimension=%u completionFence=%p completionValue=%llu durationUs=%llu",
+            static_cast<unsigned long long>(trace ? event : NextSequence()),
+            static_cast<unsigned long long>(call),
+            static_cast<int32_t>(result),
+            static_cast<uint32_t>(state.status),
+            state.numFramesActuallyPresented,
+            state.structVersion >= sl::kStructVersion2
+                ? state.numFramesToGenerateMax : UINT32_MAX,
+            static_cast<unsigned long long>(state.estimatedVRAMUsageInBytes),
+            state.minWidthOrHeight,
+            state.structVersion >= sl::kStructVersion3
+                ? state.inputsProcessingCompletionFence : nullptr,
+            static_cast<unsigned long long>(
+                state.structVersion >= sl::kStructVersion3
+                    ? state.lastPresentInputsProcessingCompletionFenceValue
+                    : 0u),
+            static_cast<unsigned long long>(duration));
     }
     return result;
 }
@@ -444,6 +557,7 @@ Result slSetFeatureLoaded(sl::Feature feature, bool enabled)
 Result slSetTagCommonImpl(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags,
     sl::CommandBuffer* cmdBuffer, bool useResourceTaggingForFrame, const sl::FrameToken& frame)
 {
+    using namespace renodx::streamline_diagnostics;
     //! IMPORTANT:
     //! 
     //! As explained in sl_struct.h any new elements must be placed at the end
@@ -457,6 +571,77 @@ Result slSetTagCommonImpl(const sl::ViewportHandle& viewport, const sl::Resource
     const sl::plugin_manager::FeatureContext* ctx;
     SL_CHECK(slValidateFeatureContext(kFeatureCommon, ctx));
     if (!tags || numTags == 0) return Result::eErrorInvalidParameter;
+    const uint64_t tagCall = tag_calls.fetch_add(
+        1u, std::memory_order_relaxed) + 1u;
+    bool traceTags = tagCall % 16u == 0u && TakeDetailedTrace();
+    bool hudlessPresent{};
+    uint64_t hudlessNative{};
+    for (uint32_t index = 0u; index < numTags; ++index)
+    {
+        if (tags[index].type == sl::kBufferTypeHUDLessColor)
+        {
+            hudlessPresent = true;
+            hudlessNative = tags[index].resource
+                ? reinterpret_cast<uint64_t>(tags[index].resource->native)
+                : 0u;
+            break;
+        }
+    }
+    {
+        static std::mutex tagDiagnosticsMutex;
+        static std::unordered_map<uint32_t, uint64_t> lastHudlessResource;
+        std::lock_guard<std::mutex> lock(tagDiagnosticsMutex);
+        const uint32_t viewportValue = static_cast<uint32_t>(viewport);
+        const auto found = lastHudlessResource.find(viewportValue);
+        if (hudlessPresent
+            && (found == lastHudlessResource.end()
+                || found->second != hudlessNative))
+        {
+            lastHudlessResource[viewportValue] = hudlessNative;
+            ArmDetailedTrace();
+            traceTags = true;
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] #%llu hudless.changed tagCall=%llu viewport=%u native=0x%llx",
+                static_cast<unsigned long long>(NextSequence()),
+                static_cast<unsigned long long>(tagCall),
+                viewportValue,
+                static_cast<unsigned long long>(hudlessNative));
+        }
+    }
+    if (traceTags)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu tags.begin call=%llu viewport=%u count=%u commandBuffer=%p frameBased=%u",
+            static_cast<unsigned long long>(NextSequence()),
+            static_cast<unsigned long long>(tagCall),
+            static_cast<uint32_t>(viewport),
+            numTags,
+            cmdBuffer,
+            useResourceTaggingForFrame ? 1u : 0u);
+        for (uint32_t index = 0u; index < numTags; ++index)
+        {
+            const sl::Resource* resource = tags[index].resource;
+            SL_LOG_INFO(
+                "[RenoDX][diag-v1] tag call=%llu index=%u type=%u lifecycle=%u resource=%p native=%p memory=%p view=%p state=%u size=%ux%u format=%u usage=0x%x extent=%u,%u,%u,%u",
+                static_cast<unsigned long long>(tagCall),
+                index,
+                static_cast<uint32_t>(tags[index].type),
+                static_cast<uint32_t>(tags[index].lifecycle),
+                resource,
+                resource ? resource->native : nullptr,
+                resource ? resource->memory : nullptr,
+                resource ? resource->view : nullptr,
+                resource ? resource->state : UINT32_MAX,
+                resource ? resource->width : 0u,
+                resource ? resource->height : 0u,
+                resource ? resource->nativeFormat : 0u,
+                resource ? resource->usage : 0u,
+                tags[index].extent.left,
+                tags[index].extent.top,
+                tags[index].extent.width,
+                tags[index].extent.height);
+        }
+    }
     std::vector<sl::ResourceTag> adjustedTags;
     const sl::ResourceTag* effectiveTags = tags;
     const uint32_t outputFormat = RenoDXAddonVulkanOutputFormat();
@@ -480,9 +665,20 @@ Result slSetTagCommonImpl(const sl::ViewportHandle& viewport, const sl::Resource
             effectiveTags = adjustedTags.data();
         }
     }
-    return (useResourceTaggingForFrame
+    const Result tagResult = (useResourceTaggingForFrame
         ? ctx->setTagForFrame(frame, viewport, effectiveTags, numTags, cmdBuffer)
         : ctx->setTag(viewport, effectiveTags, numTags, cmdBuffer));
+    if (traceTags || tagResult != Result::eOk)
+    {
+        SL_LOG_INFO(
+            "[RenoDX][diag-v1] #%llu tags.end call=%llu result=%d hudlessSuppressed=%u outputFormat=%u",
+            static_cast<unsigned long long>(NextSequence()),
+            static_cast<unsigned long long>(tagCall),
+            static_cast<int32_t>(tagResult),
+            hudlessPresent && !adjustedTags.empty() ? 1u : 0u,
+            outputFormat);
+    }
+    return tagResult;
 }
 
 Result slSetTagCommon(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags,
@@ -1247,6 +1443,12 @@ Result slGetFeatureFunction(sl::Feature feature, const char* functionName, void*
             s_renodxOriginalDLSSGSetOptions =
                 reinterpret_cast<PFun_slDLSSGSetOptions*>(function);
             function = reinterpret_cast<void*>(&RenoDXDLSSGSetOptions);
+        }
+        else if (std::strcmp(functionName, "slDLSSGGetState") == 0)
+        {
+            s_renodxOriginalDLSSGGetState =
+                reinterpret_cast<PFun_slDLSSGGetState*>(function);
+            function = reinterpret_cast<void*>(&RenoDXDLSSGGetState);
         }
     }
     return function ? Result::eOk : Result::eErrorMissingOrInvalidAPI;
