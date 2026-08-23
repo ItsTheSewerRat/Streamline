@@ -61,7 +61,7 @@ inline renodx::streamline_bridge::ManageVulkanClientImageV1 GetManager()
     if (!manager)
     {
         if (const HMODULE addon =
-                ::GetModuleHandleW(L"renodx-endfield-vk.addon64"))
+                ::GetModuleHandleW(L"renodx-endfield-fg.addon64"))
         {
             manager = reinterpret_cast<
                 renodx::streamline_bridge::ManageVulkanClientImageV1>(
@@ -134,7 +134,7 @@ inline bool SetDisplayReadyPQPresent(bool active)
     if (!setter)
     {
         if (const HMODULE addon =
-                ::GetModuleHandleW(L"renodx-endfield-vk.addon64"))
+                ::GetModuleHandleW(L"renodx-endfield-fg.addon64"))
         {
             setter = reinterpret_cast<
                 renodx::streamline_bridge::SetVulkanDisplayReadyPQPresentV1>(

@@ -167,7 +167,7 @@ void ConfigureLogOverrides(log::ILog* log)
 template<typename T>
 T RenoDXGetAddonExport(const char* name)
 {
-    const HMODULE addon = ::GetModuleHandleW(L"renodx-endfield-vk.addon64");
+    const HMODULE addon = ::GetModuleHandleW(L"renodx-endfield-fg.addon64");
     return addon ? reinterpret_cast<T>(::GetProcAddress(addon, name)) : nullptr;
 }
 
